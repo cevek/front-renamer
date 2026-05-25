@@ -148,6 +148,9 @@ front-renamer <ops.json> [options]
                        → tsconfig.json.
   --src <path>         Source directory to scan. Default: <cwd>/src.
   --skip-typecheck     Skip pre-/post-typecheck (faster, less safe).
+  --no-rollback        Disable auto-rollback on post-typecheck failure.
+                       (Default: rollback ON when the working tree was clean.)
+  --no-prune           Don't remove empty directories left behind by moves.
   --quiet              Reduce output to errors and final status.
   -h, --help           Show this help.
 ```
@@ -169,6 +172,19 @@ front-renamer <ops.json> [options]
   file. The tool builds a dependency graph and applies in the right order.
 - **Swap-via-temp** — pass two folders through a temporary name to exchange
   them: `A → __tmp`, `B → A`, `__tmp → B`. Planner figures out the order.
+- **Glob sources** — `["src/components/ds/*", "src/components/"]` expands to
+  one op per matched child. `*` must be in the final path segment.
+- **Templated destinations** — variables `{name}`, `{stem}`, `{ext}`,
+  `{parent}` plus filters `lc`, `uc`, `kebab`, `strip:Suffix`,
+  `stripPrefix:Prefix`. Example pattern:
+  `"src/features/{stem|strip:Section|kebab}/{stem|strip:Section}View.tsx"`.
+- **Path rewrites in non-TS files** — pass `--rewrite-paths-in <glob>` for
+  files like `index.html` or `vite.config.ts` to substitute path references
+  to anything you've moved.
+- **Empty directory cleanup** — recursive prune after commit; `--no-prune`
+  to keep them.
+- **Auto-rollback** — when the working tree is clean at start, a failed
+  post-typecheck is reverted via `git reset --hard && git clean -fd`.
 - **Random input order** — your ops don't need to be sorted. The planner
   topologically sorts them and reports parallel-safe phases.
 
@@ -234,16 +250,27 @@ real demand.
 
 ## Safety
 
-- **Run from a clean git working tree.** This is your rollback. The tool
-  doesn't transact across hundreds of operations — if you don't like the
-  result, `git restore . && git clean -fd` puts you back. That only works if
-  there were no uncommitted changes when you started.
+- **Run from a clean git working tree.** Two reasons:
+  1. **Auto-rollback** snapshots `HEAD` before applying and restores on
+     post-typecheck failure (`git reset --hard <sha> && git clean -fd`).
+     This is the safety net. It only engages when the tree was clean at
+     start — otherwise the rollback would also wipe your unrelated edits.
+     Disable with `--no-rollback`.
+  2. **Manual rollback**. If you somehow disabled auto-rollback or didn't
+     trust it, `git restore . && git clean -fd` still works the same way.
 - **Pre-typecheck**: refuses to run if your project already has TS errors
   (so post-typecheck failures are clearly attributable to the refactor).
 - **Dry-run by default**: nothing touches disk until you pass `--apply`.
-- **Post-typecheck**: full TS pass after commit. Non-zero exit if anything
-  broke, with the changes preserved on disk for inspection.
+- **Post-typecheck**: full TS pass after commit. On failure, auto-rollback
+  if armed; otherwise non-zero exit with changes preserved for inspection.
 - **`git mv`**: real moves, not delete+add. `git log --follow` survives.
+- **Empty dirs cleaned up** after moves (deep recursive, with `--no-prune`
+  to disable).
+
+> **Run Prettier / ESLint after `--apply`.** The tool emits import specifiers
+> with double quotes (`"./x"`) regardless of your project's style. It also
+> doesn't reformat the surrounding code after rewrites. A single `prettier
+> --write` (or your usual `pnpm run format`) puts everything back in shape.
 
 ## Programmatic use
 

@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as ts from 'typescript';
 import type {NormalizedOp, RefactorOp, RefactorOpInput} from './schema.js';
+import {deriveVars, isTemplate, renderTemplate} from './template.js';
 
 export interface ProjectInfo {
     root: string;
@@ -143,8 +144,74 @@ function autodetectRename(from: string, to: string, root: string): {old: string;
     return null;
 }
 
+/**
+ * Expand glob-source ops into one op per matched child.
+ *
+ *   ["src/components/ds/*", "src/components/"]
+ *   → ["src/components/ds/A", "src/components/A"]
+ *     ["src/components/ds/B", "src/components/B"]
+ *     ...
+ *
+ * The `*` must be in the FINAL segment of `from` (one-level wildcard). `to`
+ * is treated as the destination DIRECTORY — each matched child keeps its name.
+ */
+function expandGlob(input: RefactorOpInput, root: string): RefactorOpInput[] {
+    const from = Array.isArray(input) ? input[0] : input.from;
+    if (!from.includes('*')) return [input];
+
+    const segments = from.split('/');
+    const wildcardIdx = segments.findIndex((s) => s.includes('*'));
+    if (wildcardIdx !== segments.length - 1) {
+        throw new Error(`glob '*' must be in the final path segment: ${from}`);
+    }
+    const dirRel = segments.slice(0, -1).join('/');
+    const pattern = segments[segments.length - 1];
+    // Convert simple `*Name.tsx`-style patterns into a regex.
+    const re = new RegExp(
+        '^' +
+            pattern
+                .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+                .replace(/\*/g, '.*') +
+            '$',
+    );
+
+    const dirAbs = path.resolve(root, dirRel);
+    if (!fs.existsSync(dirAbs)) {
+        throw new Error(`glob source dir not found: ${dirRel}`);
+    }
+    const entries = fs.readdirSync(dirAbs).filter((n) => re.test(n));
+    if (entries.length === 0) {
+        throw new Error(`glob matched zero entries: ${from}`);
+    }
+
+    const to = Array.isArray(input) ? input[1] : input.to;
+    const renameSymbols = Array.isArray(input) ? undefined : input.renameSymbols;
+    const templated = isTemplate(to);
+    const toDir = !templated && to.endsWith('/') ? to.slice(0, -1) : to;
+
+    return entries.map((name) => {
+        const childFrom = `${dirRel}/${name}`;
+        let childTo: string;
+        if (templated) {
+            const vars = deriveVars(childFrom);
+            childTo = renderTemplate(to, vars);
+        } else {
+            childTo = `${toDir}/${name}`;
+        }
+        if (renameSymbols !== undefined) {
+            return {from: childFrom, to: childTo, renameSymbols};
+        }
+        return [childFrom, childTo];
+    });
+}
+
 export function normalizeOps(ops: RefactorOpInput[], root: string): NormalizedOp[] {
-    return ops.map((raw, index) => {
+    // Expand globs first, then decode.
+    const expanded: RefactorOpInput[] = [];
+    for (const raw of ops) {
+        for (const exp of expandGlob(raw, root)) expanded.push(exp);
+    }
+    return expanded.map((raw, index) => {
         const decoded = decode(raw, root);
         const fromAbs = path.resolve(root, decoded.from);
         const toAbs = path.resolve(root, decoded.to);

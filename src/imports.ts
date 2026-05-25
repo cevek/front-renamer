@@ -51,13 +51,17 @@ export function rewriteImportsInFile(
                 const targetNode = locateTargetNode(resolved, tree);
                 if (targetNode) {
                     const targetCurrent = targetNode.currentPath();
+                    // Use the ACTUAL extension of the resolved target file. `path.extname(resolved)`
+                    // is empty when the specifier omits the extension (e.g. `./shared` → resolves
+                    // to `shared.tsx`), which used to leave `.tsx` in the emitted specifier.
+                    const targetExt = path.extname(targetNode.initialName);
                     const newSpec = emitSpecifier(
                         targetCurrent,
                         importerCurrentDir,
                         project,
                         spec,
                         wasAlias,
-                        path.extname(resolved),
+                        targetExt,
                     );
                     if (newSpec !== spec) {
                         edits.push({

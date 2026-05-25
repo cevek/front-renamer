@@ -235,27 +235,41 @@ export class Engine {
             fs.writeFileSync(target, node.readContent());
         }
 
-        // Cleanup: rmdir any empty ancestor dirs of moved-away locations.
-        this.removeEmptyAncestors(explicitMoves.map((n) => path.dirname(n.initialPath())));
+        // Cleanup: recursive walk of the source tree to remove any directory
+        // that ended up empty after the moves (covers deep subdirs that were
+        // never explicitly named in any op).
+        if (this.pruneEmptyDirs) {
+            this.removeEmptyDirsRecursive(this.project.srcDir);
+        }
     }
 
-    private removeEmptyAncestors(dirs: string[]): void {
-        const srcDir = path.join(this.project.root, 'src');
-        const candidates = new Set<string>();
-        for (const d of dirs) {
-            let cur = d;
-            while (cur.length > srcDir.length) {
-                candidates.add(cur);
-                cur = path.dirname(cur);
+    /** Whether to recursively delete empty directories after commit. Defaults to true. */
+    pruneEmptyDirs = true;
+
+    private removeEmptyDirsRecursive(dir: string): boolean {
+        // Returns true iff `dir` was removed (and is now gone from disk).
+        if (!fs.existsSync(dir)) return false;
+        const entries = fs.readdirSync(dir, {withFileTypes: true});
+        let allChildrenRemoved = true;
+        for (const entry of entries) {
+            const child = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                const removed = this.removeEmptyDirsRecursive(child);
+                if (!removed) allChildrenRemoved = false;
+            } else {
+                allChildrenRemoved = false;
             }
         }
-        const sorted = Array.from(candidates).sort((a, b) => b.length - a.length);
-        for (const d of sorted) {
+        // Don't prune the configured source root itself even if it became empty —
+        // that would surprise the caller. Only prune *descendants*.
+        if (allChildrenRemoved && dir !== this.project.srcDir) {
             try {
-                if (fs.existsSync(d) && fs.readdirSync(d).length === 0) fs.rmdirSync(d);
+                fs.rmdirSync(dir);
+                return true;
             } catch {
-                /* ignore */
+                return false;
             }
         }
+        return false;
     }
 }
