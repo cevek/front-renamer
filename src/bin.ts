@@ -285,13 +285,13 @@ function gitHeadSha(root: string): string | null {
 function printDrySummary(engine: Engine, levels: number, quiet: boolean, fullDiff: boolean): void {
     if (quiet) return;
     const moves: Array<{from: string; to: string}> = [];
-    const edits: Array<{file: string; size: number}> = [];
+    const edits: Array<{node: import('./vfs.js').FsNode; size: number}> = [];
     for (const node of engine.tree.iterFiles()) {
         if (node.currentPath() !== node.initialPath()) {
             moves.push({from: node.initialPath(), to: node.currentPath()});
         }
         if (node.hasContentOverride()) {
-            edits.push({file: node.currentPath(), size: node.readContent().length});
+            edits.push({node, size: node.readContent().length});
         }
     }
     for (const node of engine.tree.iterDirs()) {
@@ -316,10 +316,48 @@ function printDrySummary(engine: Engine, levels: number, quiet: boolean, fullDif
         const editsShow = Math.min(20, edits.length);
         console.log(`\nedited files (${editsShow}${edits.length > editsShow ? ` of ${edits.length}` : ''}):`);
         for (const e of edits.slice(0, editsShow)) {
-            console.log(`  ${path.relative(engine.project.root, e.file)}  (${e.size} bytes)`);
+            const rel = path.relative(engine.project.root, e.node.currentPath());
+            const lineDiffs = computeLineDiff(e.node.initialPath(), e.node.readContent());
+            console.log(`\n  ${rel}  (${lineDiffs.length} line(s) changed, ${e.size} bytes total)`);
+            for (const d of lineDiffs.slice(0, 8)) {
+                console.log(`    \x1b[31m- ${d.before}\x1b[0m`);
+                console.log(`    \x1b[32m+ ${d.after}\x1b[0m`);
+            }
+            if (lineDiffs.length > 8) console.log(`    …and ${lineDiffs.length - 8} more line change(s)`);
         }
         if (edits.length > editsShow) console.log(`  …and ${edits.length - editsShow} more`);
     }
+}
+
+function computeLineDiff(originalPath: string, currentContent: string): Array<{line: number; before: string; after: string}> {
+    let originalContent: string;
+    try {
+        originalContent = fs.readFileSync(originalPath, 'utf8');
+    } catch {
+        return [];
+    }
+    const origLines = originalContent.split('\n');
+    const curLines = currentContent.split('\n');
+    const out: Array<{line: number; before: string; after: string}> = [];
+    // Identifier renames and import rewrites preserve line count, so a simple
+    // line-by-line comparison is enough to surface the actual edits.
+    const max = Math.min(origLines.length, curLines.length);
+    for (let i = 0; i < max; i++) {
+        if (origLines[i] !== curLines[i]) {
+            out.push({line: i + 1, before: origLines[i].trim(), after: curLines[i].trim()});
+        }
+    }
+    // If line counts diverged (rare), append the tail as before/empty or empty/after.
+    if (origLines.length !== curLines.length) {
+        for (let i = max; i < Math.max(origLines.length, curLines.length); i++) {
+            out.push({
+                line: i + 1,
+                before: i < origLines.length ? origLines[i].trim() : '',
+                after: i < curLines.length ? curLines[i].trim() : '',
+            });
+        }
+    }
+    return out;
 }
 
 main().catch((err) => {

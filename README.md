@@ -212,8 +212,6 @@ semantics.
   aliases).
 - **It doesn't commit to git.** It uses `git mv` for relocations so history
   is preserved, but writing the commit (and its message) is your job.
-- **It doesn't rollback on failure.** If post-typecheck fails, changes stay
-  on disk for inspection. Use `git restore .` to abandon, or fix forward.
 - **It doesn't resolve dynamic imports.** `import(someVariable)` and
   `require(someExpr)` are invisible — only string-literal specifiers get
   rewritten.
@@ -222,9 +220,13 @@ semantics.
 - **It doesn't rename non-exported locals.** Identifier renames target
   declarations referenced across files. A function-local variable named the
   same as your component stays untouched (which is what you want).
-- **It doesn't move non-TS assets except sibling styles.** `.module.scss` and
-  `.module.css` next to a `.tsx` follow automatically. Everything else
-  (images, JSON fixtures, MDX, etc.) needs an explicit op.
+- **It doesn't auto-attach non-TS assets by import graph.** Sibling
+  `.module.scss` / `.module.css` next to a moved `.tsx` follow automatically.
+  Anything else (regular `.css`, images, JSON fixtures, MDX) needs an
+  **explicit op** — which works fine: `["src/index.css", "src/styles/global.css"]`
+  moves the file and rewrites the `import "./index.css"` reference too.
+  The tool doesn't try to guess from the import graph which assets should
+  travel along.
 
 ## Monorepos
 

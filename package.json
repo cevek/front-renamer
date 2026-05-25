@@ -1,6 +1,6 @@
 {
   "name": "front-renamer",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Declarative bulk refactor tool for React/TypeScript repos. Moves files and folders, rewrites imports, and renames identifiers via the TypeScript language service. Pure TS, no ts-morph.",
   "type": "module",
   "bin": {
