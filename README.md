@@ -73,6 +73,12 @@ You describe the destination. The tool computes the path.
 
 ## Quick start
 
+> **Before you run `--apply`, commit or stash everything in your working tree.**
+> The tool rewrites hundreds of files in one shot. If anything looks off
+> afterwards (post-typecheck failure, missed import, surprise file move), the
+> only painless rollback is `git restore .` + `git clean -fd`. That only works
+> if the pre-run state was clean.
+
 ```bash
 # Preview what would change — no disk writes
 npx front-renamer ops.json --dry
@@ -204,8 +210,34 @@ semantics.
   `.module.css` next to a `.tsx` follow automatically. Everything else
   (images, JSON fixtures, MDX, etc.) needs an explicit op.
 
+## Monorepos
+
+front-renamer is built around a single TypeScript project: one `tsconfig`, one
+source directory, one alias scope. That covers **per-package refactors** in
+any monorepo flavor (pnpm / npm / yarn workspaces, Nx, Turborepo, Lerna) —
+just point `--cwd` at the package you're restructuring:
+
+```bash
+cd packages/web
+npx front-renamer ops.json --cwd . --tsconfig tsconfig.json --src src --apply
+```
+
+`git mv` still works for files anywhere in the repo, so history stays intact
+across the whole monorepo.
+
+**What's not supported yet**: cross-package moves (sliding a file from
+`packages/a` into `packages/b` while also rewriting `@org/b`-style workspace
+imports), simultaneous multi-package refactors, and renaming a workspace
+package itself (the `name` in its `package.json` plus every `dependencies`
+reference). These need a bigger workspace-aware mode — coming when there's
+real demand.
+
 ## Safety
 
+- **Run from a clean git working tree.** This is your rollback. The tool
+  doesn't transact across hundreds of operations — if you don't like the
+  result, `git restore . && git clean -fd` puts you back. That only works if
+  there were no uncommitted changes when you started.
 - **Pre-typecheck**: refuses to run if your project already has TS errors
   (so post-typecheck failures are clearly attributable to the refactor).
 - **Dry-run by default**: nothing touches disk until you pass `--apply`.

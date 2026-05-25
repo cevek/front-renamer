@@ -198,7 +198,10 @@ export class Engine {
             let cursor: FsNode | null = node;
             while (cursor && cursor.initialParent) {
                 if (moved.has(cursor.initialParent)) {
-                    return path.join(cursor.initialParent.currentPath(), ...trail.reverse(), cursor.initialName);
+                    // ancestor.currentPath() / cursor.initialName / [trail reversed]
+                    // cursor is the immediate child of the moved ancestor; trail accumulated
+                    // names innermost-first while walking up, so reverse to descend.
+                    return path.join(cursor.initialParent.currentPath(), cursor.initialName, ...trail.reverse());
                 }
                 trail.push(cursor.initialName);
                 cursor = cursor.initialParent;
