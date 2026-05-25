@@ -54,7 +54,7 @@ function expandGlob(root: string, pattern: string): string[] {
             return;
         }
         for (const entry of entries) {
-            if (entry.name === 'node_modules' || entry.name === '.git') continue;
+            if (SKIP_DIRS.has(entry.name)) continue;
             const full = path.join(dir, entry.name);
             if (entry.isDirectory()) walk(full);
             else if (re.test(full)) out.push(full);
@@ -63,6 +63,12 @@ function expandGlob(root: string, pattern: string): string[] {
     walk(root);
     return out;
 }
+
+const SKIP_DIRS = new Set([
+    'node_modules', '.git', '.svn', '.hg',
+    'dist', 'build', 'out', 'coverage',
+    '.next', '.turbo', '.cache',
+]);
 
 /** Convert a list of glob patterns into an absolute file list. */
 export function resolveExtraPaths(root: string, globs: string[]): string[] {
@@ -73,20 +79,13 @@ export function resolveExtraPaths(root: string, globs: string[]): string[] {
     return Array.from(seen);
 }
 
-/** Build a list of (oldRel, newRel) tuples from the VFS tree. */
+/**
+ * Build a list of (oldRel, newRel) tuples from the VFS tree. Skips directories
+ * because file-level entries already cover every actually-relocated path; the
+ * dir entries would only widen the chance of partial matches.
+ */
 function collectRelocations(tree: VFSTree, root: string): Array<{oldRel: string; newRel: string}> {
     const out: Array<{oldRel: string; newRel: string}> = [];
-    for (const node of tree.iterDirs()) {
-        if (node === tree.root) continue;
-        const initial = node.initialPath();
-        const current = node.currentPath();
-        if (initial !== current) {
-            out.push({
-                oldRel: path.relative(root, initial).split(path.sep).join('/'),
-                newRel: path.relative(root, current).split(path.sep).join('/'),
-            });
-        }
-    }
     for (const node of tree.iterFiles()) {
         const initial = node.initialPath();
         const current = node.currentPath();
@@ -97,8 +96,6 @@ function collectRelocations(tree: VFSTree, root: string): Array<{oldRel: string;
             });
         }
     }
-    // Longer paths first so a more specific replacement wins over a more general one
-    // (e.g. `src/main.tsx` replaced before `src/main`).
     return out.sort((a, b) => b.oldRel.length - a.oldRel.length);
 }
 
@@ -119,16 +116,36 @@ export function rewriteExtraPaths(
     const relocations = collectRelocations(tree, root);
     if (relocations.length === 0) return {hits: [], changed: 0};
 
-    // Build regexes once. We match a path-shape substring: anchor on a boundary
-    // that signals "this is a path here, not a random substring" — quote, slash,
-    // space, equals, paren, start of string, end of string. `/` is included on
-    // the left side so root-relative URLs like `/src/main.tsx` are matched.
-    const boundary = `(?<=^|["'\` \\t\\n=,(\\[<>/])`;
-    const tail = `(?=["'\` \\t\\n=,)\\]>?:&]|$)`;
-    const escapedRegexes = relocations.map(({oldRel, newRel}) => ({
-        re: new RegExp(boundary + escapeRegex(oldRel) + tail, 'g'),
-        newRel,
-    }));
+    // Boundary policy:
+    //  - LEFT  side: start-of-string, quote (`'"` `` ` ``), whitespace, `=,(`,
+    //                `<`, or a directory separator that EITHER starts a root-
+    //                relative URL (e.g. `/src/main.tsx` in HTML) OR is the very
+    //                start of the literal we want to match. We exclude embedded
+    //                `/` between two ordinary chars so `"../src/main.tsx"` does
+    //                NOT lop off `src/main.tsx` and leave dangling `../`.
+    //  - RIGHT side: end-of-string OR a non-path closer.
+    //
+    // Implementation: left boundary is either a "clean" punctuation char OR a
+    // `/` immediately preceded by quote/start. We can't fully express that in
+    // one regex with lookbehinds reliably across runtimes, so we match against
+    // BOTH the path AND the path-with-leading-slash, with the latter requiring
+    // a clean left boundary too.
+    const cleanLeft = `(?<=^|["'\`\\s=,(\\[<>])`;
+    const tail = `(?=["'\`\\s=,)\\]>?:&]|$)`;
+    const escapedRegexes: Array<{re: RegExp; replacement: string}> = [];
+    for (const {oldRel, newRel} of relocations) {
+        // Match `…/<oldRel>` ONLY when the leading slash itself is at a clean
+        // boundary (root-relative URL or freshly-quoted path).
+        escapedRegexes.push({
+            re: new RegExp(cleanLeft + '/' + escapeRegex(oldRel) + tail, 'g'),
+            replacement: '/' + newRel,
+        });
+        // Match bare `<oldRel>` at a clean boundary.
+        escapedRegexes.push({
+            re: new RegExp(cleanLeft + escapeRegex(oldRel) + tail, 'g'),
+            replacement: newRel,
+        });
+    }
 
     const hits: RewriteHit[] = [];
     let changed = 0;
@@ -141,10 +158,10 @@ export function rewriteExtraPaths(
         }
         let next = content;
         let replaced = 0;
-        for (const {re, newRel} of escapedRegexes) {
+        for (const {re, replacement} of escapedRegexes) {
             next = next.replace(re, () => {
                 replaced++;
-                return newRel;
+                return replacement;
             });
         }
         if (replaced > 0) {

@@ -131,6 +131,70 @@ that the basename can't express — list them explicitly under `renameSymbols`.
 
 Pass `"renameSymbols": []` to suppress autodetection.
 
+### Extracting a symbol into a new file
+
+Lift a top-level component, hook, or type out of a busy file:
+
+```json
+{
+  "extract": "Header",
+  "from": "src/Sales/Sales.tsx",
+  "to":   "src/Sales/Header/Header.tsx"
+}
+```
+
+Multiple extracts into the same target are honoured — first creates the file,
+each subsequent one merges in.
+
+> **Extract relies entirely on the TypeScript language service.** If TS itself
+> can't perform "Move to a new file" / "Move to file" for a given symbol —
+> common triggers: complex alias imports the LS can't fully resolve, the file
+> has only one top-level statement, or a deep TS LS internal assertion — the
+> tool will refuse the op with a clear message. **In that case, delete the op
+> from your JSON and extract the symbol by hand.** The tool will not invent
+> its own refactor logic; it would silently corrupt the file.
+
+#### Co-extracting CSS Modules
+
+Set `"css": "copy-safe"` on an extract op:
+
+```json
+{
+  "extract": "Header",
+  "from": "src/Sales/Sales.tsx",
+  "to":   "src/Sales/Header/Header.tsx",
+  "css":  "copy-safe"
+}
+```
+
+The tool walks the source file's sibling `.module.scss`/`.module.css`, figures
+out which classes the extracted block uses, and moves the **provably safe** ones
+into a fresh stylesheet next to the extracted file. Anything that doesn't pass
+the safety bar stays in the original sheet; references to those classes get
+rewritten to `sLegacy.X` (with an auto-injected legacy import) so the extracted
+file still compiles. The tool prints a per-class report:
+
+```
+--- CSS co-extract ---
+  src/Sales/Sales.module.scss  →  src/Sales/Header/Header.module.scss
+    moved (safe): .title, .icon
+    left behind (manual review):
+      .body   — class appears in a compound selector elsewhere
+      .label  — uses @include mixin
+```
+
+> **Safe co-extract is conservative but not magic.** Stylesheets vary wildly —
+> `@use`/`@import` chains, parent selectors, `@extend %placeholder`, deeply
+> nested media queries, value interpolation through Sass functions, mixin
+> arguments referencing the outer scope. The tool refuses to move anything it
+> can't reason about cleanly, but a handful of micro-cases (CSS-in-JS shapes
+> we don't recognise, comment-attachment quirks across postcss versions,
+> specifier resolution through tsconfig paths in non-relative imports) can
+> still produce a stylesheet that **looks** right but breaks at runtime.
+> **Always diff the output, eyeball the moved/left-behind report, and run your
+> visual regression tests before merging.** A handful of leftover unsafe
+> classes is the expected outcome — that's the design.
+
 ### Path conventions
 
 - Paths are relative to the project root (or `--cwd <path>`).

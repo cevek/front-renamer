@@ -78,6 +78,46 @@ export function buildPlan(ops: NormalizedOp[]): PlanResult {
     for (const a of ops) {
         for (const b of ops) {
             if (a === b) continue;
+
+            // ---------- Extract-specific ordering ----------
+            // Two extract ops merging into the SAME target file run sequentially —
+            // the first one creates/uses the file, the second appends to it.
+            if (
+                a.kind === 'extract' &&
+                b.kind === 'extract' &&
+                a.toAbs === b.toAbs &&
+                a.index < b.index
+            ) {
+                addEdge(a.index, b.index);
+            }
+            // An extract from a source file must run BEFORE any move op whose `from`
+            // is that source file (so the source has fewer symbols when it moves).
+            if (a.kind === 'extract' && b.kind === 'move' && a.fromAbs === b.fromAbs) {
+                addEdge(a.index, b.index);
+            }
+            // If an extract's source is the TARGET of a move (extract from a file
+            // we're moving INTO place), the move must land first.
+            if (a.kind === 'move' && b.kind === 'extract' && a.toAbs === b.fromAbs) {
+                addEdge(a.index, b.index);
+            }
+            // Chain of extracts: extract1 creates a file, extract2 lifts a symbol
+            // back out of it. The producer must run first.
+            if (a.kind === 'extract' && b.kind === 'extract' && a.toAbs === b.fromAbs) {
+                addEdge(a.index, b.index);
+            }
+            // If a move's target sits INSIDE the source dir of an extract, ensure
+            // the extract first so its synthetic file isn't dragged unexpectedly.
+            if (
+                a.kind === 'extract' &&
+                b.kind === 'move' &&
+                (a.toAbs === b.fromAbs ||
+                    a.toAbs.startsWith(b.fromAbs + path.sep))
+            ) {
+                addEdge(a.index, b.index);
+            }
+            // ---------- The remaining rules concern move ops on paths. ----------
+            if (a.kind === 'extract' || b.kind === 'extract') continue;
+
             // 1. B.from descendant of A.from → B before A
             if (isDescendant(b.fromAbs, a.fromAbs)) addEdge(b.index, a.index);
             // 2. B.from descendant of A.to → A before B

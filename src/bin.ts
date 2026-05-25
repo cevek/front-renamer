@@ -91,6 +91,14 @@ function parseArgs(argv: string[]): CliArgs {
     const rewritePathsIn: string[] = [];
     let fullDiff = false;
 
+    const takeValue = (flag: string, i: number): string => {
+        const v = argv[i + 1];
+        if (v === undefined || v.startsWith('--')) {
+            throw new Error(`flag ${flag} requires a value`);
+        }
+        return v;
+    };
+
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '-h' || a === '--help') {
@@ -103,10 +111,10 @@ function parseArgs(argv: string[]): CliArgs {
         else if (a === '--no-prune') prune = false;
         else if (a === '--diff') fullDiff = true;
         else if (a === '--quiet') quiet = true;
-        else if (a === '--cwd') cwd = path.resolve(argv[++i]);
-        else if (a === '--tsconfig') tsconfigPath = argv[++i];
-        else if (a === '--src') srcDir = argv[++i];
-        else if (a === '--rewrite-paths-in') rewritePathsIn.push(argv[++i]);
+        else if (a === '--cwd') cwd = path.resolve(takeValue('--cwd', i++));
+        else if (a === '--tsconfig') tsconfigPath = takeValue('--tsconfig', i++);
+        else if (a === '--src') srcDir = takeValue('--src', i++);
+        else if (a === '--rewrite-paths-in') rewritePathsIn.push(takeValue('--rewrite-paths-in', i++));
         else if (a.startsWith('--')) throw new Error(`unknown flag: ${a}`);
         else positional.push(a);
     }
@@ -197,37 +205,69 @@ async function main() {
     }
 
     // -------- Stage 4 + 5: in-memory engine --------
+    // Wrap in try/finally so disk stubs are cleaned up even if a stage throws.
     log(args.quiet, '[4/6] applying ops in-memory…');
     const engine = new Engine(project);
     engine.pruneEmptyDirs = args.prune;
-    engine.applyToVFS(plan.levels);
-    log(args.quiet, `     ${engine.summarize()}`);
+    let succeeded = false;
+    try {
+        engine.applyToVFS(plan.levels);
+        log(args.quiet, `     ${engine.summarize()}`);
 
-    log(args.quiet, '[5/6] rewriting imports…');
-    const {filesChanged} = engine.rewriteAllImports();
-    log(args.quiet, `     ✓ ${filesChanged} file(s) had imports rewritten`);
+        log(args.quiet, '[5/6] rewriting imports…');
+        const {filesChanged} = engine.rewriteAllImports();
+        log(args.quiet, `     ✓ ${filesChanged} file(s) had imports rewritten`);
 
-    if (args.mode === 'dry') {
-        log(args.quiet, '[6/6] DRY MODE — not committing to disk.');
-        printDrySummary(engine, plan.levels.length, args.quiet, args.fullDiff);
-        return;
-    }
+        if (args.mode === 'dry') {
+            log(args.quiet, '[6/6] DRY MODE — not committing to disk.');
+            printDrySummary(engine, plan.levels.length, args.quiet, args.fullDiff);
+            printCssReports(engine, args.quiet);
+            succeeded = true;
+            return;
+        }
 
-    // -------- Stage 6: commit + post-typecheck --------
-    log(args.quiet, '[6/6] committing to disk (git mv + writeFile)…');
-    engine.commit();
-    log(args.quiet, '     ✓ commit complete');
+        // -------- Stage 6: commit + post-typecheck (INSIDE try so a mid-commit
+        // throw still triggers stub cleanup AND attempts rollback) --------
+        log(args.quiet, '[6/6] committing to disk (git mv + writeFile)…');
+        engine.commit();
+        log(args.quiet, '     ✓ commit complete');
 
-    if (args.rewritePathsIn.length > 0) {
-        const extraFiles = resolveExtraPaths(root, args.rewritePathsIn);
-        log(args.quiet, `     rewriting paths in ${extraFiles.length} extra file(s)…`);
-        const {hits, changed} = rewriteExtraPaths(extraFiles, engine.tree, root);
-        log(args.quiet, `     ✓ ${changed} extra file(s) updated`);
-        if (!args.quiet) {
-            for (const h of hits.slice(0, 10)) {
-                console.log(`       ${path.relative(root, h.file)}: ${h.replaced} replacement(s)`);
+        if (args.rewritePathsIn.length > 0) {
+            const extraFiles = resolveExtraPaths(root, args.rewritePathsIn);
+            log(args.quiet, `     rewriting paths in ${extraFiles.length} extra file(s)…`);
+            const {hits, changed} = rewriteExtraPaths(extraFiles, engine.tree, root);
+            log(args.quiet, `     ✓ ${changed} extra file(s) updated`);
+            if (!args.quiet) {
+                for (const h of hits.slice(0, 10)) {
+                    console.log(`       ${path.relative(root, h.file)}: ${h.replaced} replacement(s)`);
+                }
+                if (hits.length > 10) console.log(`       …and ${hits.length - 10} more`);
             }
-            if (hits.length > 10) console.log(`       …and ${hits.length - 10} more`);
+        }
+
+        printCssReports(engine, args.quiet);
+        succeeded = true;
+    } catch (err) {
+        // Stage failed: try rollback if armed. The catch sits between try and
+        // finally so cleanup still runs afterwards.
+        if (args.mode === 'apply' && rollbackSha) {
+            process.stderr.write(`\n[rollback] error during apply — reverting to ${rollbackSha.slice(0, 7)}…\n`);
+            process.stderr.write(`  cause: ${(err as Error).message}\n`);
+            try {
+                execFileSync('git', ['reset', '--hard', rollbackSha], {cwd: root, stdio: 'pipe'});
+                execFileSync('git', ['clean', '-fd'], {cwd: root, stdio: 'pipe'});
+                process.stderr.write('[rollback] working tree restored.\n');
+            } catch (rbErr) {
+                process.stderr.write(`[rollback] failed: ${(rbErr as Error).message}\n`);
+            }
+        }
+        throw err;
+    } finally {
+        // Dry: always. Apply on failure: cleanup so stubs don't leak.
+        // Apply on success: stubs overwritten by commit, but the createdDirs
+        // cleanup still rmdir's empty dirs — safe to call.
+        if (args.mode === 'dry' || !succeeded) {
+            engine.cleanupExtractStubs();
         }
     }
 
@@ -358,6 +398,26 @@ function computeLineDiff(originalPath: string, currentContent: string): Array<{l
         }
     }
     return out;
+}
+
+function printCssReports(engine: Engine, quiet: boolean): void {
+    const reports = engine.cssReports;
+    if (reports.length === 0 || quiet) return;
+    console.log('\n--- CSS co-extract ---');
+    for (const r of reports) {
+        const src = path.relative(engine.project.root, r.sourceStylesheet);
+        const tgt = path.relative(engine.project.root, r.targetStylesheet);
+        console.log(`\n  ${src}  →  ${tgt}`);
+        if (r.moved.length > 0) {
+            console.log(`    moved (safe): ${r.moved.map((c) => '.' + c).join(', ')}`);
+        }
+        if (r.leftBehind.length > 0) {
+            console.log(`    left behind (manual review):`);
+            for (const lb of r.leftBehind) {
+                console.log(`      .${lb.class}  — ${lb.reason}`);
+            }
+        }
+    }
 }
 
 main().catch((err) => {

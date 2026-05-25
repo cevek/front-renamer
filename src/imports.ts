@@ -64,10 +64,19 @@ export function rewriteImportsInFile(
                         targetExt,
                     );
                     if (newSpec !== spec) {
+                        // Preserve the original quote style — read the first char of
+                        // the existing literal text rather than always emitting double
+                        // quotes via JSON.stringify.
+                        const start = moduleSpec.getStart(sf);
+                        const quote = original[start];
+                        const quoted =
+                            quote === "'" || quote === '`'
+                                ? quote + newSpec.replace(new RegExp(quote, 'g'), '\\' + quote) + quote
+                                : JSON.stringify(newSpec);
                         edits.push({
-                            start: moduleSpec.getStart(sf),
+                            start,
                             end: moduleSpec.getEnd(),
-                            replacement: JSON.stringify(newSpec),
+                            replacement: quoted,
                         });
                     }
                 }
@@ -124,13 +133,13 @@ function locateTargetNode(resolvedAbs: string, tree: VFSTree): FsNode | null {
         // still rewrite the path even if the scss isn't tracked, by walking the parent dir.
         return null;
     }
-    for (const ext of ['.tsx', '.ts']) {
+    for (const ext of ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.cjs']) {
         const n = tree.findByInitialPath(resolvedAbs + ext);
         if (n) return n;
     }
     const asDir = tree.findByInitialPath(resolvedAbs);
     if (asDir) return asDir;
-    for (const ext of ['.tsx', '.ts']) {
+    for (const ext of ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.cjs']) {
         const idx = tree.findByInitialPath(path.join(resolvedAbs, 'index' + ext));
         if (idx) return idx;
     }

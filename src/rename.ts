@@ -21,19 +21,27 @@ export class RenameEngine {
         const sourceFiles = new Set(project.sourceFiles);
         const host: ts.LanguageServiceHost = {
             getCompilationSettings: () => project.compilerOptions,
-            getScriptFileNames: () => Array.from(sourceFiles),
-            getScriptVersion: (fileName) => String(this.versions.get(fileName) ?? 0),
+            // Include any file the tree currently knows about — covers files
+            // produced by extract before a subsequent rename can see them.
+            getScriptFileNames: () => {
+                const all = new Set(sourceFiles);
+                for (const node of this.tree.iterFiles()) {
+                    if (/\.(ts|tsx)$/.test(node.initialName)) all.add(node.initialPath());
+                }
+                return Array.from(all);
+            },
+            getScriptVersion: (fileName) => this.computeVersion(fileName),
             getScriptSnapshot: (fileName) => {
                 const text = this.readByInitialPath(fileName);
                 return text !== null ? ts.ScriptSnapshot.fromString(text) : undefined;
             },
             getCurrentDirectory: () => project.root,
             getDefaultLibFileName: ts.getDefaultLibFilePath,
-            fileExists: (p) => safeStat(p)?.isFile() ?? false,
-            readFile: (p) => {
-                const text = this.readByInitialPath(p);
-                return text ?? undefined;
+            fileExists: (p) => {
+                if (this.tree.findByInitialPath(p)) return true;
+                return safeStat(p)?.isFile() ?? false;
             },
+            readFile: (p) => this.readByInitialPath(p) ?? undefined,
             directoryExists: (p) => safeStat(p)?.isDirectory() ?? false,
             getDirectories: (p) => {
                 try {
@@ -48,6 +56,20 @@ export class RenameEngine {
             realpath: ts.sys.realpath,
         };
         this.service = ts.createLanguageService(host, ts.createDocumentRegistry());
+    }
+
+    /**
+     * Version is `<localBump>:<contentHash>`. The hash changes whenever the
+     * VFS node's content overlay changes — guarantees the LS notices edits made
+     * by ExtractEngine (or any earlier rename op). djb2 (32-bit) is plenty for
+     * cache invalidation and avoids length-only collisions (e.g. swapping two
+     * identifiers of equal length).
+     */
+    private computeVersion(fileName: string): string {
+        const node = this.tree.findByInitialPath(fileName);
+        const bump = this.versions.get(fileName) ?? 0;
+        if (!node?.hasContentOverride()) return `${bump}:0`;
+        return `${bump}:${djb2(node.readContent())}`;
     }
 
     private readByInitialPath(initialAbs: string): string | null {
@@ -77,8 +99,10 @@ export class RenameEngine {
         const position = this.findDeclarationPosition(sf, oldName);
         if (position === null) return {touched: 0};
 
+        // `providePrefixAndSuffixTextForRename = true` lets TS emit shorthand-property
+        // disambiguation like `{Foo: Bar}` instead of corrupting `{Foo}` destructures.
         const locations =
-            this.service.findRenameLocations(initialPath, position, false, false, false) ?? [];
+            this.service.findRenameLocations(initialPath, position, false, false, true) ?? [];
         const extra = this.findMatchingDefaultImportLocals(program, initialPath, oldName);
 
         const byFile = new Map<string, Array<{start: number; end: number}>>();
@@ -113,38 +137,36 @@ export class RenameEngine {
         return {touched};
     }
 
+    /** Only top-level declarations — never recurses into nested scopes. */
     private findDeclarationPosition(sf: ts.SourceFile, name: string): number | null {
-        let pos: number | null = null;
-        const visit = (node: ts.Node) => {
-            if (pos !== null) return;
-            if (ts.isFunctionDeclaration(node) && node.name?.text === name) {
-                pos = node.name.getStart(sf);
-                return;
+        for (const stmt of sf.statements) {
+            if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === name) {
+                return stmt.name.getStart(sf);
             }
-            if (ts.isClassDeclaration(node) && node.name?.text === name) {
-                pos = node.name.getStart(sf);
-                return;
+            if (ts.isClassDeclaration(stmt) && stmt.name?.text === name) {
+                return stmt.name.getStart(sf);
             }
-            if (ts.isVariableStatement(node)) {
-                for (const decl of node.declarationList.declarations) {
+            if (ts.isInterfaceDeclaration(stmt) && stmt.name.text === name) {
+                return stmt.name.getStart(sf);
+            }
+            if (ts.isTypeAliasDeclaration(stmt) && stmt.name.text === name) {
+                return stmt.name.getStart(sf);
+            }
+            if (ts.isEnumDeclaration(stmt) && stmt.name.text === name) {
+                return stmt.name.getStart(sf);
+            }
+            if (ts.isModuleDeclaration(stmt) && ts.isIdentifier(stmt.name) && stmt.name.text === name) {
+                return stmt.name.getStart(sf);
+            }
+            if (ts.isVariableStatement(stmt)) {
+                for (const decl of stmt.declarationList.declarations) {
                     if (ts.isIdentifier(decl.name) && decl.name.text === name) {
-                        pos = decl.name.getStart(sf);
-                        return;
+                        return decl.name.getStart(sf);
                     }
                 }
             }
-            if (ts.isInterfaceDeclaration(node) && node.name.text === name) {
-                pos = node.name.getStart(sf);
-                return;
-            }
-            if (ts.isTypeAliasDeclaration(node) && node.name.text === name) {
-                pos = node.name.getStart(sf);
-                return;
-            }
-            ts.forEachChild(node, visit);
-        };
-        visit(sf);
-        return pos;
+        }
+        return null;
     }
 
     private findMatchingDefaultImportLocals(
@@ -203,4 +225,11 @@ function safeStat(p: string): fs.Stats | null {
     } catch {
         return null;
     }
+}
+
+/** djb2 — cheap 32-bit content hash for LS cache-invalidation versioning. */
+function djb2(s: string): string {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
+    return (h >>> 0).toString(16);
 }

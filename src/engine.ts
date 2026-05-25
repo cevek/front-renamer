@@ -15,11 +15,12 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {execFileSync} from 'node:child_process';
-import type {NormalizedOp, PlanLevel} from './schema.js';
+import type {PlanLevel} from './schema.js';
 import type {ProjectInfo} from './preflight.js';
 import {VFSTree, type FsNode} from './vfs.js';
 import {RenameEngine} from './rename.js';
 import {rewriteImportsInFile} from './imports.js';
+import {ExtractEngine} from './extract.js';
 
 export class Engine {
     readonly tree: VFSTree;
@@ -35,21 +36,27 @@ export class Engine {
 
     /** Apply every level in order to the tree. No disk writes yet. */
     applyToVFS(levels: PlanLevel[]): void {
-        // ---- Phase 1: relocations + folder renames (tree mutations) ----
+        // ---- Tree mutations honour the plan DAG: one pass per level, dispatching
+        // by op kind. Extracts and moves can be interleaved across levels (e.g.
+        // a move that produces a file the next level's extract reads from). ----
         for (const lvl of levels) {
             for (const op of lvl.ops) {
-                this.applyOpToTree(op);
+                if (op.kind === 'extract') this.applyExtract(op);
+                else this.applyMoveToTree(op);
             }
         }
 
-        // ---- Phase 2: identifier renames (TS language service) ----
+        // ---- Identifier renames run after all tree mutations: they're driven
+        // through the TS language service and don't care about physical layout. ----
         for (const lvl of levels) {
             for (const op of lvl.ops) {
-                if (op.renameSymbols.length === 0) continue;
+                if (op.kind !== 'move' || op.renameSymbols.length === 0) continue;
                 const declNode = this.declNodes.get(op.index);
                 if (!declNode) {
                     const names = op.renameSymbols.map((r) => r.old).join(', ');
-                    console.warn(`  ⚠ op#${op.index}: declaring file not found for symbol(s) ${names}`);
+                    process.stderr.write(
+                        `  ⚠ op#${op.index}: declaring file not found for symbol(s) ${names}\n`,
+                    );
                     continue;
                 }
                 for (const sym of op.renameSymbols) {
@@ -59,11 +66,28 @@ export class Engine {
         }
     }
 
-    /** Tree-side application of a single op. Captures the declaring file node for later rename. */
-    private applyOpToTree(op: NormalizedOp): void {
-        // op.fromAbs is in CURRENT-path coords at the time the op was written.
-        // Since later ops may already have mutated this subtree, we look up via
-        // current path right now (BEFORE this op applies).
+    /** TS LS "Move to a new file" → place the resulting file at op.to. */
+    private applyExtract(op: import('./schema.js').NormalizedExtractOp): void {
+        if (!this.extracts) {
+            this.extracts = new ExtractEngine(this.project, this.tree, this.renames);
+        }
+        this.extracts.extract(op);
+    }
+
+    private extracts: ExtractEngine | null = null;
+
+    /** Delete any disk stubs the extract phase wrote (dry-run cleanup). */
+    cleanupExtractStubs(): void {
+        this.extracts?.cleanupDiskStubs();
+    }
+
+    /** Reports from CSS co-extraction (for output). */
+    get cssReports(): ReadonlyArray<import('./extract-css.js').CssCoExtractReport> {
+        return this.extracts?.cssReports ?? [];
+    }
+
+    /** Tree-side application of a single MOVE op. */
+    private applyMoveToTree(op: import('./schema.js').NormalizedMoveOp): void {
         const node = this.tree.findByCurrentPath(op.fromAbs);
         if (!node) {
             console.warn(`  ⚠ op#${op.index}: source not found in tree: ${op.from}`);
@@ -74,7 +98,6 @@ export class Engine {
         const newName = path.basename(op.toAbs);
         node.moveTo(newParent, newName);
 
-        // For file ops (not folders), sibling .module.scss / .module.css must travel with the .tsx.
         if (!op.isFolder && /\.(tsx?|jsx?)$/.test(node.initialName) && node.initialParent) {
             const initBase = node.initialName.replace(/\.(tsx?|jsx?)$/, '');
             const newBase = path.basename(op.toAbs, path.extname(op.toAbs));
@@ -84,16 +107,10 @@ export class Engine {
             }
         }
 
-        // Capture the declaring file node (for Phase 2 symbol rename). The reference
-        // survives any subsequent moves because nodes are persistent identities.
         if (op.renameSymbols.length > 0) {
             if (!op.isFolder) {
                 this.declNodes.set(op.index, node);
             } else {
-                // Folder rename: the FIRST renameSymbol entry is assumed to name the main
-                // `<oldName>.tsx` file in the folder. Rename that + its sibling .scss/.css.
-                // Additional entries in `renameSymbols` will be applied to references inside
-                // the same declaring file in Phase 2.
                 const first = op.renameSymbols[0];
                 for (const ext of ['.tsx', '.ts', '.module.scss', '.module.css']) {
                     const child = node.childByCurrent(first.old + ext);
@@ -154,11 +171,18 @@ export class Engine {
         // renames inside the moved folder.
 
         const movers: FsNode[] = [];
+        // New files (synthetic, no disk presence at initialPath) are handled separately below
+        // via writeFile — they're not moves.
+        const newFiles: FsNode[] = [];
         for (const node of this.tree.iterDirs()) {
             if (node === this.tree.root) continue;
             if (node.currentPath() !== node.initialPath()) movers.push(node);
         }
         for (const node of this.tree.iterFiles()) {
+            if (!fs.existsSync(node.initialPath())) {
+                newFiles.push(node);
+                continue;
+            }
             if (node.currentPath() !== node.initialPath()) movers.push(node);
         }
 
@@ -217,20 +241,31 @@ export class Engine {
             try {
                 execFileSync('git', ['mv', '-k', from, to], {cwd: root, stdio: 'pipe'});
                 moved.add(node);
-            } catch (err) {
+            } catch (gitErr) {
                 try {
                     fs.renameSync(from, to);
                     moved.add(node);
-                } catch (err2) {
-                    console.error(`  ✗ failed to move ${from} → ${to}: ${(err2 as Error).message}`);
-                    throw err;
+                } catch (fsErr) {
+                    process.stderr.write(
+                        `  ✗ failed to move ${from} → ${to}: ${(fsErr as Error).message}\n` +
+                            `    (git mv error: ${(gitErr as Error).message})\n`,
+                    );
+                    throw fsErr;
                 }
             }
+        }
+
+        // Write brand-new files (produced by extract / similar) to disk.
+        for (const node of newFiles) {
+            const target = node.currentPath();
+            fs.mkdirSync(path.dirname(target), {recursive: true});
+            fs.writeFileSync(target, node.readContent());
         }
 
         // Now overlay content edits at the new (current) paths.
         for (const node of this.tree.iterFiles()) {
             if (!node.hasContentOverride()) continue;
+            if (newFiles.includes(node)) continue; // already written above
             const target = node.currentPath();
             fs.writeFileSync(target, node.readContent());
         }
@@ -246,12 +281,19 @@ export class Engine {
     /** Whether to recursively delete empty directories after commit. Defaults to true. */
     pruneEmptyDirs = true;
 
+    private static readonly PRUNE_SKIP = new Set([
+        'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'coverage', '.next', '.turbo', '.cache',
+    ]);
+
     private removeEmptyDirsRecursive(dir: string): boolean {
-        // Returns true iff `dir` was removed (and is now gone from disk).
         if (!fs.existsSync(dir)) return false;
         const entries = fs.readdirSync(dir, {withFileTypes: true});
         let allChildrenRemoved = true;
         for (const entry of entries) {
+            if (Engine.PRUNE_SKIP.has(entry.name)) {
+                allChildrenRemoved = false;
+                continue;
+            }
             const child = path.join(dir, entry.name);
             if (entry.isDirectory()) {
                 const removed = this.removeEmptyDirsRecursive(child);
@@ -260,8 +302,6 @@ export class Engine {
                 allChildrenRemoved = false;
             }
         }
-        // Don't prune the configured source root itself even if it became empty —
-        // that would surprise the caller. Only prune *descendants*.
         if (allChildrenRemoved && dir !== this.project.srcDir) {
             try {
                 fs.rmdirSync(dir);

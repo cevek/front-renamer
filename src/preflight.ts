@@ -4,8 +4,19 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as ts from 'typescript';
-import type {NormalizedOp, RefactorOp, RefactorOpInput} from './schema.js';
+import type {
+    NormalizedExtractOp,
+    NormalizedMoveOp,
+    NormalizedOp,
+    RefactorOp,
+    RefactorOpExtract,
+    RefactorOpInput,
+} from './schema.js';
 import {deriveVars, isTemplate, renderTemplate} from './template.js';
+
+function isExtractOp(input: RefactorOpInput): input is RefactorOpExtract {
+    return !Array.isArray(input) && 'extract' in input && typeof (input as RefactorOpExtract).extract === 'string';
+}
 
 export interface ProjectInfo {
     root: string;
@@ -53,13 +64,23 @@ export function loadProject(root: string, opts: LoadProjectOptions = {}): Projec
     const paths = parsed.options.paths ?? {};
     const baseUrl = parsed.options.baseUrl ?? path.dirname(tsconfigPath);
     for (const [key, vals] of Object.entries(paths)) {
-        if (!key.endsWith('/*')) continue;
-        const aliasPrefix = key.slice(0, -1); // '@/*' → '@/'
+        // Glob form: `"@/*": ["./src/*"]` — both sides end with /*. Prefix match.
+        if (key.endsWith('/*')) {
+            const aliasPrefix = key.slice(0, -1); // '@/*' → '@/'
+            for (const v of vals) {
+                if (!v.endsWith('/*')) continue;
+                const target = v.slice(0, -1); // './src/*' → './src/'
+                const absPrefix = path.resolve(baseUrl, target);
+                aliasPrefixes.push({aliasPrefix, absPrefix});
+            }
+            continue;
+        }
+        // Bare form: `"@types": ["./types"]` — single specifier → single file/dir.
+        // Represent as a prefix where both sides include a trailing slash so
+        // ONLY the exact key matches via `===` paths in the rewriter.
         for (const v of vals) {
-            if (!v.endsWith('/*')) continue;
-            const target = v.slice(0, -1); // './src/*' → './src/'
-            const absPrefix = path.resolve(baseUrl, target);
-            aliasPrefixes.push({aliasPrefix, absPrefix});
+            if (v.endsWith('/*')) continue;
+            aliasPrefixes.push({aliasPrefix: key, absPrefix: path.resolve(baseUrl, v)});
         }
     }
 
@@ -92,12 +113,18 @@ function collectSourceFiles(dir: string): string[] {
     return out;
 }
 
-/**
- * Decode an input op (tuple or full object) into the canonical RefactorOp shape.
- * Auto-detects a single `renameSymbols` entry when basenames change and the field
- * is omitted entirely (pass `renameSymbols: []` in the full form to suppress).
- */
+/** Decode an input op into the canonical discriminated-union RefactorOp shape. */
 function decode(input: RefactorOpInput, root: string): RefactorOp {
+    if (isExtractOp(input)) {
+        return {
+            kind: 'extract',
+            extract: input.extract,
+            from: input.from,
+            to: input.to,
+            css: input.css ?? 'none',
+        };
+    }
+
     let from: string;
     let to: string;
     let renameSymbols: Array<{old: string; new: string}> | undefined;
@@ -107,7 +134,7 @@ function decode(input: RefactorOpInput, root: string): RefactorOp {
             throw new Error(`tuple op must be [from, to]: ${JSON.stringify(input)}`);
         }
         [from, to] = input;
-        renameSymbols = undefined; // → autodetect below
+        renameSymbols = undefined;
     } else {
         from = input.from;
         to = input.to;
@@ -119,7 +146,7 @@ function decode(input: RefactorOpInput, root: string): RefactorOp {
         renameSymbols = detected ? [detected] : [];
     }
 
-    return {from, to, renameSymbols};
+    return {kind: 'move', from, to, renameSymbols};
 }
 
 function autodetectRename(from: string, to: string, root: string): {old: string; new: string} | null {
@@ -156,24 +183,27 @@ function autodetectRename(from: string, to: string, root: string): {old: string;
  * is treated as the destination DIRECTORY — each matched child keeps its name.
  */
 function expandGlob(input: RefactorOpInput, root: string): RefactorOpInput[] {
+    if (isExtractOp(input)) return [input]; // extract ops don't use glob
     const from = Array.isArray(input) ? input[0] : input.from;
-    if (!from.includes('*')) return [input];
+    if (!from.includes('*') && !from.includes('?')) return [input];
 
     const segments = from.split('/');
-    const wildcardIdx = segments.findIndex((s) => s.includes('*'));
+    const wildcardIdx = segments.findIndex((s) => /[*?]/.test(s));
     if (wildcardIdx !== segments.length - 1) {
-        throw new Error(`glob '*' must be in the final path segment: ${from}`);
+        throw new Error(`glob wildcard must be in the final path segment: ${from}`);
     }
     const dirRel = segments.slice(0, -1).join('/');
     const pattern = segments[segments.length - 1];
-    // Convert simple `*Name.tsx`-style patterns into a regex.
-    const re = new RegExp(
-        '^' +
-            pattern
-                .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
-                .replace(/\*/g, '.*') +
-            '$',
-    );
+    // Patterns: `*` (any chars except '/'), `?` (one char). Other regex
+    // metacharacters are escaped so users can mix literal punctuation.
+    let reSrc = '';
+    for (const ch of pattern) {
+        if (ch === '*') reSrc += '[^/]*';
+        else if (ch === '?') reSrc += '[^/]';
+        else if ('.+^${}()|[]\\'.includes(ch)) reSrc += '\\' + ch;
+        else reSrc += ch;
+    }
+    const re = new RegExp('^' + reSrc + '$');
 
     const dirAbs = path.resolve(root, dirRel);
     if (!fs.existsSync(dirAbs)) {
@@ -181,7 +211,11 @@ function expandGlob(input: RefactorOpInput, root: string): RefactorOpInput[] {
     }
     const entries = fs.readdirSync(dirAbs).filter((n) => re.test(n));
     if (entries.length === 0) {
-        throw new Error(`glob matched zero entries: ${from}`);
+        // Throw a TAGGED error that bin.ts/normalizeOps catches and converts to a
+        // friendly validation message instead of a fatal stack trace.
+        const err = new Error(`glob matched zero entries: ${from}`) as Error & {kind?: string};
+        err.kind = 'validation';
+        throw err;
     }
 
     const to = Array.isArray(input) ? input[1] : input.to;
@@ -206,20 +240,53 @@ function expandGlob(input: RefactorOpInput, root: string): RefactorOpInput[] {
 }
 
 export function normalizeOps(ops: RefactorOpInput[], root: string): NormalizedOp[] {
-    // Expand globs first, then decode.
     const expanded: RefactorOpInput[] = [];
     for (const raw of ops) {
-        for (const exp of expandGlob(raw, root)) expanded.push(exp);
+        try {
+            for (const exp of expandGlob(raw, root)) expanded.push(exp);
+        } catch (err) {
+            const e = err as Error & {kind?: string};
+            if (e.kind === 'validation') {
+                // Re-throw a marked Error so bin.ts presents it cleanly.
+                throw new GlobValidationError(e.message);
+            }
+            throw err;
+        }
     }
-    return expanded.map((raw, index) => {
+    return expanded.map((raw, index): NormalizedOp => {
         const decoded = decode(raw, root);
         const fromAbs = path.resolve(root, decoded.from);
         const toAbs = path.resolve(root, decoded.to);
+        if (decoded.kind === 'extract') {
+            const out: NormalizedExtractOp = {
+                ...decoded,
+                index,
+                fromAbs,
+                toAbs,
+                isFolder: false,
+            };
+            return out;
+        }
         const ext = path.extname(decoded.from);
         const isFolder = ext === '';
         const sameParent = path.dirname(fromAbs) === path.dirname(toAbs);
-        return {...decoded, index, fromAbs, toAbs, isFolder, sameParent};
+        const out: NormalizedMoveOp = {
+            ...decoded,
+            index,
+            fromAbs,
+            toAbs,
+            isFolder,
+            sameParent,
+        };
+        return out;
     });
+}
+
+export class GlobValidationError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'GlobValidationError';
+    }
 }
 
 export interface ValidationError {
@@ -233,9 +300,26 @@ export function validateOps(ops: NormalizedOp[]): ValidationError[] {
     const seenFrom = new Map<string, number>();
     const seenTo = new Map<string, number>();
 
+    // Extract ops legitimately repeat `from` (many extracts from one source) and
+    // `to` (many symbols collected into one target). Duplicate-checking applies
+    // only to move ops. For extracts we require (from, to, symbol) to be unique.
+    const seenExtract = new Map<string, number>();
     for (const op of ops) {
         if (op.from === op.to) {
             errors.push({index: op.index, op, reason: 'from === to (no-op)'});
+        }
+        if (op.kind === 'extract') {
+            const key = `${op.fromAbs}|${op.toAbs}|${op.extract}`;
+            const prev = seenExtract.get(key);
+            if (prev !== undefined) {
+                errors.push({
+                    index: op.index,
+                    op,
+                    reason: `duplicate extract — same symbol "${op.extract}" from "${op.from}" to "${op.to}" already at op #${prev}`,
+                });
+            }
+            seenExtract.set(key, op.index);
+            continue;
         }
         const prevFrom = seenFrom.get(op.fromAbs);
         if (prevFrom !== undefined) {

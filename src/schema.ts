@@ -1,12 +1,19 @@
 /**
- * Public op schema — two equivalent forms:
+ * Public op schema. Three forms:
  *
- *   SHORT (tuple):   ["src/components/SalesPage", "src/components/SalesView"]
+ *   SHORT tuple:    ["src/components/SalesPage", "src/components/SalesView"]
  *
- *   FULL (object):   {
+ *   FULL move:      {
  *     "from": "src/components/SalesPage",
- *     "to": "src/components/SalesView",
+ *     "to":   "src/components/SalesView",
  *     "renameSymbols": [{"old": "SalesPage", "new": "SalesView"}]
+ *   }
+ *
+ *   EXTRACT:        {
+ *     "extract": "Header",
+ *     "from":    "src/Sales/Sales.tsx",
+ *     "to":      "src/Sales/Header/Header.tsx",
+ *     "css":     "none"
  *   }
  *
  * Paths are relative to the project root. Folder vs file is inferred from
@@ -21,11 +28,14 @@
  *     → auto-add `{old: basename(from), new: basename(to)}`
  * Pass an empty array `renameSymbols: []` to suppress auto-detection.
  *
- * Multiple entries in `renameSymbols` let you rename several identifiers
- * declared in the same file in one op (e.g. component + its `Props` type +
- * an internal helper).
+ * `extract` uses the TypeScript language service "Move to a new file" refactor
+ * to lift a top-level declaration out of `from` into a new file at `to`. The
+ * `css` field controls sibling stylesheet handling:
+ *   - "none" (default) — styles are NOT touched; the extracted file keeps a
+ *     relative import to the original `.module.scss`.
+ *   - "copy-safe", "empty-stub" — coming in 2.1.
  */
-export type RefactorOpInput = RefactorOpShort | RefactorOpFull;
+export type RefactorOpInput = RefactorOpShort | RefactorOpFull | RefactorOpExtract;
 
 export type RefactorOpShort = [from: string, to: string];
 
@@ -35,35 +45,53 @@ export interface RefactorOpFull {
     renameSymbols?: Array<{old: string; new: string}>;
 }
 
+export interface RefactorOpExtract {
+    extract: string;
+    from: string;
+    to: string;
+    css?: 'none' | 'copy-safe' | 'empty-stub';
+}
+
 export interface OpsInput {
     ops: RefactorOpInput[];
 }
 
-/** After normalization — uniform internal shape. */
-export interface RefactorOp {
+/** Discriminator on `kind`. */
+export type RefactorOp = RefactorOpMoveNormalized | RefactorOpExtractNormalized;
+
+export interface RefactorOpMoveNormalized {
+    kind: 'move';
     from: string;
     to: string;
-    /** Always present, possibly empty. */
     renameSymbols: Array<{old: string; new: string}>;
 }
 
-/** Augmented form after preflight: absolute paths, classified, indexed. */
-export interface NormalizedOp extends RefactorOp {
-    /** Index in the original input array (for stable error messages). */
+export interface RefactorOpExtractNormalized {
+    kind: 'extract';
+    extract: string;
+    from: string;
+    to: string;
+    css: 'none' | 'copy-safe' | 'empty-stub';
+}
+
+/** Augmented form after preflight. */
+export type NormalizedOp = NormalizedMoveOp | NormalizedExtractOp;
+
+interface NormalizedOpBase {
+    /** Index in the original input array. */
     index: number;
-    /** Resolved absolute source path. */
     fromAbs: string;
-    /** Resolved absolute target path. */
     toAbs: string;
-    /** True if `from`/`to` are a directory; false if a file. */
+}
+
+export interface NormalizedMoveOp extends NormalizedOpBase, RefactorOpMoveNormalized {
     isFolder: boolean;
-    /** True when source and target sit in the same parent directory. */
     sameParent: boolean;
 }
 
-/** @deprecated kept temporarily for callers that still expect the legacy single-symbol shape. */
-export interface NormalizedOpLegacy extends Omit<NormalizedOp, 'renameSymbols'> {
-    renameSymbol?: {old: string; new: string};
+export interface NormalizedExtractOp extends NormalizedOpBase, RefactorOpExtractNormalized {
+    /** Extract is always file-shape. */
+    isFolder: false;
 }
 
 /** One level of the execution plan; ops within the same level are mutually independent. */

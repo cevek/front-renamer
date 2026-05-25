@@ -62,14 +62,34 @@ export class FsNode {
 
     addChild(node: FsNode): void {
         if (this.kind !== 'dir') throw new Error(`addChild on non-dir: ${this.currentPath()}`);
+        // Hard collision check on the active key. Initial-name overlap is allowed
+        // only when the existing entry is the node itself (idempotent add).
+        const colliding = this.childrenByCurrent.get(node.currentName);
+        if (colliding && colliding !== node) {
+            throw new Error(
+                `addChild: name collision in ${this.currentPath()}: ${node.currentName} already exists`,
+            );
+        }
         node.parent = this;
-        this.childrenByInitial.set(node.initialName, node);
+        // Only register the initial-name key if it doesn't already point at something else
+        // — protects against silent overwrites when synthetic nodes share an initialName
+        // with a sibling that was removed-then-re-added.
+        if (!this.childrenByInitial.has(node.initialName)) {
+            this.childrenByInitial.set(node.initialName, node);
+        }
         this.childrenByCurrent.set(node.currentName, node);
     }
 
     removeChild(node: FsNode): void {
-        this.childrenByInitial.delete(node.initialName);
-        this.childrenByCurrent.delete(node.currentName);
+        // Guard against blind name-based deletion: only remove map entries that
+        // ACTUALLY point at this node, so we never evict a sibling that re-used
+        // the same key.
+        if (this.childrenByInitial.get(node.initialName) === node) {
+            this.childrenByInitial.delete(node.initialName);
+        }
+        if (this.childrenByCurrent.get(node.currentName) === node) {
+            this.childrenByCurrent.delete(node.currentName);
+        }
     }
 
     childByInitial(name: string): FsNode | undefined {
@@ -85,8 +105,25 @@ export class FsNode {
 
     /** Path the node currently *lives at* (walks parents using current names). */
     currentPath(): string {
-        if (!this.parent) return this.currentName;
-        return path.join(this.parent.currentPath(), this.currentName);
+        // Iterative to avoid stack overflow on pathological trees / accidental
+        // self-cycles caught by moveTo's guard.
+        const segments: string[] = [];
+        let cur: FsNode | null = this;
+        const seen = new Set<FsNode>();
+        while (cur) {
+            if (seen.has(cur)) {
+                throw new Error(`currentPath: cycle detected at ${cur.currentName}`);
+            }
+            seen.add(cur);
+            if (!cur.parent) {
+                segments.push(cur.currentName);
+                break;
+            }
+            segments.push(cur.currentName);
+            cur = cur.parent;
+        }
+        segments.reverse();
+        return segments.length === 1 ? segments[0] : path.join(...segments);
     }
 
     /** Path the node *was at* when the tree was built. Stable across moves/renames. */
@@ -96,17 +133,21 @@ export class FsNode {
 
     /** Rename this node (change its name only; parent stays). */
     rename(newName: string): void {
+        if (newName === this.currentName) return;
         if (this.parent) {
-            this.parent.childrenByCurrent.delete(this.currentName);
-        }
-        this.currentName = newName;
-        if (this.parent) {
-            // Future safeguard against collision.
-            if (this.parent.childrenByCurrent.has(newName)) {
+            // Collision check FIRST — never mutate state on a failure path.
+            const colliding = this.parent.childrenByCurrent.get(newName);
+            if (colliding && colliding !== this) {
                 throw new Error(
                     `name collision in ${this.parent.currentPath()}: ${newName} already exists`,
                 );
             }
+            if (this.parent.childrenByCurrent.get(this.currentName) === this) {
+                this.parent.childrenByCurrent.delete(this.currentName);
+            }
+        }
+        this.currentName = newName;
+        if (this.parent) {
             this.parent.childrenByCurrent.set(newName, this);
         }
     }
@@ -114,10 +155,26 @@ export class FsNode {
     /** Move this node under a new parent (optionally with a new name). */
     moveTo(newParent: FsNode, newName?: string): void {
         if (newParent.kind !== 'dir') throw new Error('moveTo: new parent must be a dir');
+        // Cycle guard: can't move a node into itself or one of its own descendants.
+        let walker: FsNode | null = newParent;
+        while (walker) {
+            if (walker === this) {
+                throw new Error(`moveTo: cannot move ${this.currentName} into its own subtree`);
+            }
+            walker = walker.parent;
+        }
+        const targetName = newName ?? this.currentName;
+        // Skip the work when moveTo is a no-op (same parent + same name).
+        if (this.parent === newParent && targetName === this.currentName) return;
+        // Collision check FIRST.
+        const colliding = newParent.childrenByCurrent.get(targetName);
+        if (colliding && colliding !== this) {
+            throw new Error(
+                `moveTo: name collision in ${newParent.currentPath()}: ${targetName} already exists`,
+            );
+        }
         if (this.parent) this.parent.removeChild(this);
         if (newName !== undefined) this.currentName = newName;
-        // Skip the rename collision check here — addChild does it implicitly via Map.set
-        // but a stricter check would be added if needed.
         newParent.addChild(this);
         this.parent = newParent;
     }
@@ -194,6 +251,44 @@ export class VFSTree {
             cur = next;
         }
         return cur;
+    }
+
+    /**
+     * Create a NEW file node under `parent`. Used for files that didn't exist
+     * on disk at scan time (e.g. produced by an extract op). The node's
+     * `initialPath()` is set to its current path; commit() detects "no disk
+     * presence at initialPath" and writes the file fresh rather than git-mv.
+     */
+    addFileAtCurrent(parent: FsNode, name: string, content: string): FsNode {
+        if (parent.kind !== 'dir') throw new Error('addFileAtCurrent: parent must be a dir');
+        if (parent.childByCurrent(name)) {
+            throw new Error(`file already exists at: ${path.join(parent.currentPath(), name)}`);
+        }
+        const node = new FsNode(name, 'file', parent);
+        parent.addChild(node);
+        const synthPath = path.join(parent.currentPath(), name);
+        node.captureInitialPath(synthPath);
+        node.setContent(content);
+        // Register under its synthetic initial path so importers that reference the
+        // new file by its TS-LS-chosen name (before our re-target move) can still
+        // be resolved by `findByInitialPath`.
+        this.byInitialPath.set(synthPath, node);
+        return node;
+    }
+
+    /**
+     * Make a synthetic node findable by an ADDITIONAL key in `byInitialPath`,
+     * without changing the node's own `_initialAbs`. Why: relative imports in
+     * the node's CONTENT were emitted by TS LS anchored at the LS-chosen path
+     * (the original `_initialAbs`). Touching `_initialAbs` here would shift
+     * `imports.ts`'s anchor and break resolution for every `./relative` spec
+     * in the extracted file. We KEEP `_initialAbs` at the LS-chosen path so
+     * relative-import resolution remains correct, while the map carries an
+     * extra entry for the FINAL path so external lookups (`findByInitialPath
+     * (op.toAbs)`) succeed.
+     */
+    rekeyByInitialPath(node: FsNode, _oldKey: string, newKey: string): void {
+        this.byInitialPath.set(newKey, node);
     }
 
     /** Ensure a directory chain exists at the given current path (creates synthetic dir nodes). */

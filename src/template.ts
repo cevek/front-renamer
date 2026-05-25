@@ -53,7 +53,11 @@ export function renderTemplate(template: string, vars: TemplateVars): string {
 }
 
 function readVar(name: string, vars: TemplateVars): string {
-    if (name in vars) return (vars as unknown as Record<string, string>)[name];
+    // `in` traverses the prototype chain — would let `{constructor}` etc. coerce
+    // into garbage. Use Object.hasOwn so only the four documented vars are valid.
+    if (Object.prototype.hasOwnProperty.call(vars, name)) {
+        return (vars as unknown as Record<string, string>)[name];
+    }
     throw new Error(`unknown template variable: ${name}`);
 }
 

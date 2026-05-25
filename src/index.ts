@@ -22,3 +22,11 @@ export {Engine} from './engine.js';
 export {VFSTree, FsNode} from './vfs.js';
 export {runTypecheck} from './typecheck.js';
 export type {TypecheckResult} from './typecheck.js';
+
+export {rewriteImportsInFile} from './imports.js';
+export {resolveExtraPaths, rewriteExtraPaths} from './extra-paths.js';
+export type {CssCoExtractReport} from './extract-css.js';
+export {coExtractCssModules} from './extract-css.js';
+export {ExtractEngine} from './extract.js';
+export {RenameEngine} from './rename.js';
+export {GlobValidationError} from './preflight.js';
