@@ -161,6 +161,8 @@ front-renamer <ops.json> [options]
   and rewritten alongside relative imports.
 - **Chains** — `A → B`, then later `B → C` somewhere else in the same ops
   file. The tool builds a dependency graph and applies in the right order.
+- **Swap-via-temp** — pass two folders through a temporary name to exchange
+  them: `A → __tmp`, `B → A`, `__tmp → B`. Planner figures out the order.
 - **Random input order** — your ops don't need to be sorted. The planner
   topologically sorts them and reports parallel-safe phases.
 

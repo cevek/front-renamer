@@ -23,6 +23,7 @@
  * applied at apply-time against the in-memory snapshot before any moves are
  * committed to disk. So they don't affect the DAG.
  */
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type {NormalizedOp, PlanLevel} from './schema.js';
 
@@ -30,6 +31,15 @@ function isDescendant(child: string, parent: string): boolean {
     if (child === parent) return false;
     const rel = path.relative(parent, child);
     return !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+function existedAtInit(absPath: string): boolean {
+    try {
+        fs.statSync(absPath);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 export interface PlanResult {
@@ -54,6 +64,17 @@ export function buildPlan(ops: NormalizedOp[]): PlanResult {
         }
     };
 
+    // Cache: which paths exist at init? (used to disambiguate chain vs vacate).
+    const initExists = new Map<string, boolean>();
+    const checkInit = (p: string): boolean => {
+        let v = initExists.get(p);
+        if (v === undefined) {
+            v = existedAtInit(p);
+            initExists.set(p, v);
+        }
+        return v;
+    };
+
     for (const a of ops) {
         for (const b of ops) {
             if (a === b) continue;
@@ -61,8 +82,20 @@ export function buildPlan(ops: NormalizedOp[]): PlanResult {
             if (isDescendant(b.fromAbs, a.fromAbs)) addEdge(b.index, a.index);
             // 2. B.from descendant of A.to → A before B
             if (isDescendant(b.fromAbs, a.toAbs)) addEdge(a.index, b.index);
-            // 2b. A.to === B.from → A before B  (chain: A produces what B consumes)
-            if (a.toAbs === b.fromAbs) addEdge(a.index, b.index);
+            // 3. A.to === B.from →
+            //    - if B.from existed at init: B must vacate before A overwrites (B before A).
+            //    - else: chain — A creates the path, B consumes it (A before B).
+            if (a.toAbs === b.fromAbs) {
+                if (checkInit(b.fromAbs)) addEdge(b.index, a.index);
+                else addEdge(a.index, b.index);
+            }
+            // 4. A.from === B.to →
+            //    - if A.from existed at init: A must vacate before B writes there (A before B).
+            //    - else: A.from is created by B (chain): B before A.
+            if (a.fromAbs === b.toAbs) {
+                if (checkInit(a.fromAbs)) addEdge(a.index, b.index);
+                else addEdge(b.index, a.index);
+            }
             // 5. B.to descendant of A.from → B before A
             if (isDescendant(b.toAbs, a.fromAbs)) addEdge(b.index, a.index);
         }
