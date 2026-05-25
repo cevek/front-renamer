@@ -1,0 +1,49 @@
+{
+  "name": "front-renamer",
+  "version": "1.0.0",
+  "description": "Declarative bulk refactor tool for React/TypeScript repos. Moves files and folders, rewrites imports, and renames identifiers via the TypeScript language service. Pure TS, no ts-morph.",
+  "type": "module",
+  "bin": {
+    "front-renamer": "./dist/bin.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/bin.js",
+    "watch": "tsc -p tsconfig.json --watch",
+    "prepublishOnly": "npm run build",
+    "test:e2e": "node scripts/e2e.mjs"
+  },
+  "dependencies": {
+    "typescript": ">=5.0.0 <7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "keywords": [
+    "refactor",
+    "codemod",
+    "rename",
+    "react",
+    "typescript",
+    "cli",
+    "migration"
+  ],
+  "license": "MIT"
+}

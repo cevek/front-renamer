@@ -1,0 +1,258 @@
+/**
+ * Engine: orchestrates ops over a tree-VFS.
+ *
+ * Flow:
+ *   1. Build the tree from disk.
+ *   2. For every op (in plan order): mutate the tree (rename / moveTo).
+ *      Folder ops with renameSymbol also rename the main `<oldName>.tsx`
+ *      child and its sibling `.module.scss` to follow the new symbol name.
+ *   3. Run identifier renames via TS language service (reads from initial-path
+ *      on disk, writes back to node content).
+ *   4. Rewrite imports across every file (reads/writes node content).
+ *   5. commit() walks the tree depth-first and applies `git mv` for nodes
+ *      whose currentPath differs from initialPath, then writes content overrides.
+ */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import {execFileSync} from 'node:child_process';
+import type {NormalizedOp, PlanLevel} from './schema.js';
+import type {ProjectInfo} from './preflight.js';
+import {VFSTree, type FsNode} from './vfs.js';
+import {RenameEngine} from './rename.js';
+import {rewriteImportsInFile} from './imports.js';
+
+export class Engine {
+    readonly tree: VFSTree;
+    readonly renames: RenameEngine;
+
+    constructor(public readonly project: ProjectInfo) {
+        this.tree = VFSTree.build(project.root, path.join(project.root, 'src'));
+        this.renames = new RenameEngine(project, this.tree);
+    }
+
+    /** Cache: op.index → declaring file node (set during Phase 1 application). */
+    private declNodes = new Map<number, FsNode>();
+
+    /** Apply every level in order to the tree. No disk writes yet. */
+    applyToVFS(levels: PlanLevel[]): void {
+        // ---- Phase 1: relocations + folder renames (tree mutations) ----
+        for (const lvl of levels) {
+            for (const op of lvl.ops) {
+                this.applyOpToTree(op);
+            }
+        }
+
+        // ---- Phase 2: identifier renames (TS language service) ----
+        for (const lvl of levels) {
+            for (const op of lvl.ops) {
+                if (op.renameSymbols.length === 0) continue;
+                const declNode = this.declNodes.get(op.index);
+                if (!declNode) {
+                    const names = op.renameSymbols.map((r) => r.old).join(', ');
+                    console.warn(`  ⚠ op#${op.index}: declaring file not found for symbol(s) ${names}`);
+                    continue;
+                }
+                for (const sym of op.renameSymbols) {
+                    this.renames.rename(declNode, sym.old, sym.new);
+                }
+            }
+        }
+    }
+
+    /** Tree-side application of a single op. Captures the declaring file node for later rename. */
+    private applyOpToTree(op: NormalizedOp): void {
+        // op.fromAbs is in CURRENT-path coords at the time the op was written.
+        // Since later ops may already have mutated this subtree, we look up via
+        // current path right now (BEFORE this op applies).
+        const node = this.tree.findByCurrentPath(op.fromAbs);
+        if (!node) {
+            console.warn(`  ⚠ op#${op.index}: source not found in tree: ${op.from}`);
+            return;
+        }
+
+        const newParent = this.tree.ensureDirAtCurrent(path.dirname(op.toAbs));
+        const newName = path.basename(op.toAbs);
+        node.moveTo(newParent, newName);
+
+        // For file ops (not folders), sibling .module.scss / .module.css must travel with the .tsx.
+        if (!op.isFolder && /\.(tsx?|jsx?)$/.test(node.initialName) && node.initialParent) {
+            const initBase = node.initialName.replace(/\.(tsx?|jsx?)$/, '');
+            const newBase = path.basename(op.toAbs, path.extname(op.toAbs));
+            for (const ext of ['.module.scss', '.module.css']) {
+                const sibling = node.initialParent.childByCurrent(initBase + ext);
+                if (sibling) sibling.moveTo(newParent, newBase + ext);
+            }
+        }
+
+        // Capture the declaring file node (for Phase 2 symbol rename). The reference
+        // survives any subsequent moves because nodes are persistent identities.
+        if (op.renameSymbols.length > 0) {
+            if (!op.isFolder) {
+                this.declNodes.set(op.index, node);
+            } else {
+                // Folder rename: the FIRST renameSymbol entry is assumed to name the main
+                // `<oldName>.tsx` file in the folder. Rename that + its sibling .scss/.css.
+                // Additional entries in `renameSymbols` will be applied to references inside
+                // the same declaring file in Phase 2.
+                const first = op.renameSymbols[0];
+                for (const ext of ['.tsx', '.ts', '.module.scss', '.module.css']) {
+                    const child = node.childByCurrent(first.old + ext);
+                    if (child) {
+                        child.rename(first.new + ext);
+                        if ((ext === '.tsx' || ext === '.ts') && !this.declNodes.has(op.index)) {
+                            this.declNodes.set(op.index, child);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Rewrite imports across every file in the project. */
+    rewriteAllImports(): {filesChanged: number} {
+        let filesChanged = 0;
+        for (const node of this.tree.iterFiles()) {
+            if (!/\.(ts|tsx)$/.test(node.currentName)) continue;
+            const {changed, content} = rewriteImportsInFile(node, this.project, this.tree);
+            if (changed) {
+                node.setContent(content);
+                filesChanged++;
+            }
+        }
+        return {filesChanged};
+    }
+
+    summarize(): string {
+        let moves = 0;
+        let edits = 0;
+        for (const node of this.tree.iterFiles()) {
+            if (node.currentPath() !== node.initialPath()) moves++;
+            if (node.hasContentOverride()) edits++;
+        }
+        for (const node of this.tree.iterDirs()) {
+            if (node !== this.tree.root && node.currentPath() !== node.initialPath()) moves++;
+        }
+        return `tree: ${moves} node(s) relocated, ${edits} file(s) edited`;
+    }
+
+    /** Commit: depth-first git mv + writeFile. */
+    commit(): void {
+        const root = this.project.root;
+
+        // Collect every node that physically needs to move.
+        // We do this in TWO passes:
+        //   1. Write content overrides to INITIAL paths (so the files are up to date)
+        //      then perform git mv from initial to current. — but git mv preserves
+        //      content as it is on disk, so we want content written AFTER the move.
+        //   Actually simpler: git mv first (preserves history), then writeFile to
+        //   currentPath. That way the file is at its new location, then we overlay
+        //   the new content.
+
+        // Folder moves go first (children follow), but if a child has been renamed
+        // INSIDE its folder, we need to do those too. Easiest: sort by initialPath
+        // length ASCENDING so parents move first → children inherit, then file
+        // renames inside the moved folder.
+
+        const movers: FsNode[] = [];
+        for (const node of this.tree.iterDirs()) {
+            if (node === this.tree.root) continue;
+            if (node.currentPath() !== node.initialPath()) movers.push(node);
+        }
+        for (const node of this.tree.iterFiles()) {
+            if (node.currentPath() !== node.initialPath()) movers.push(node);
+        }
+
+        // A child's relocation is "explained" by an ancestor move when:
+        //   - the child still lives under its INITIAL parent (parent ref unchanged), AND
+        //   - the child's name didn't change.
+        // In that case the ancestor's git-mv carries the child along automatically.
+        const moversSet = new Set(movers);
+        const explainedBy = (n: FsNode): boolean => {
+            if (n.parent !== n.initialParent) return false; // child moved to a new parent
+            if (n.currentName !== n.initialName) return false; // child got renamed
+            // Walk initialParent chain to find a mover.
+            let p: FsNode | null = n.initialParent;
+            while (p) {
+                if (moversSet.has(p)) return true;
+                if (p.parent !== p.initialParent) return false; // an ancestor moved away — can't inherit
+                p = p.initialParent;
+            }
+            return false;
+        };
+
+        const explicitMoves = movers.filter((n) => !explainedBy(n));
+        // Sort: directories first (shorter path), files second. Within each, by depth ascending.
+        explicitMoves.sort((a, b) => {
+            const dirA = a.kind === 'dir' ? 0 : 1;
+            const dirB = b.kind === 'dir' ? 0 : 1;
+            if (dirA !== dirB) return dirA - dirB;
+            return a.initialPath().length - b.initialPath().length;
+        });
+
+        // Track which nodes have already been physically moved on disk. The on-disk
+        // location of any descendant is computed off the closest moved ancestor.
+        const moved = new Set<FsNode>();
+        const actualOnDiskPath = (node: FsNode): string => {
+            // Walk the initial-parent chain looking for the nearest moved ancestor.
+            const trail: string[] = [];
+            let cursor: FsNode | null = node;
+            while (cursor && cursor.initialParent) {
+                if (moved.has(cursor.initialParent)) {
+                    return path.join(cursor.initialParent.currentPath(), ...trail.reverse(), cursor.initialName);
+                }
+                trail.push(cursor.initialName);
+                cursor = cursor.initialParent;
+            }
+            return node.initialPath();
+        };
+
+        for (const node of explicitMoves) {
+            const from = actualOnDiskPath(node);
+            const to = node.currentPath();
+            if (from === to) continue;
+            fs.mkdirSync(path.dirname(to), {recursive: true});
+            try {
+                execFileSync('git', ['mv', '-k', from, to], {cwd: root, stdio: 'pipe'});
+                moved.add(node);
+            } catch (err) {
+                try {
+                    fs.renameSync(from, to);
+                    moved.add(node);
+                } catch (err2) {
+                    console.error(`  ✗ failed to move ${from} → ${to}: ${(err2 as Error).message}`);
+                    throw err;
+                }
+            }
+        }
+
+        // Now overlay content edits at the new (current) paths.
+        for (const node of this.tree.iterFiles()) {
+            if (!node.hasContentOverride()) continue;
+            const target = node.currentPath();
+            fs.writeFileSync(target, node.readContent());
+        }
+
+        // Cleanup: rmdir any empty ancestor dirs of moved-away locations.
+        this.removeEmptyAncestors(explicitMoves.map((n) => path.dirname(n.initialPath())));
+    }
+
+    private removeEmptyAncestors(dirs: string[]): void {
+        const srcDir = path.join(this.project.root, 'src');
+        const candidates = new Set<string>();
+        for (const d of dirs) {
+            let cur = d;
+            while (cur.length > srcDir.length) {
+                candidates.add(cur);
+                cur = path.dirname(cur);
+            }
+        }
+        const sorted = Array.from(candidates).sort((a, b) => b.length - a.length);
+        for (const d of sorted) {
+            try {
+                if (fs.existsSync(d) && fs.readdirSync(d).length === 0) fs.rmdirSync(d);
+            } catch {
+                /* ignore */
+            }
+        }
+    }
+}

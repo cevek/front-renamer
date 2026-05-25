@@ -1,0 +1,26 @@
+[
+  ["src/components/Dashboard", "src/features/dashboard/DashboardView"],
+
+  {
+    "from": "src/components/UserSettings",
+    "to": "src/features/users/UserSettings"
+  },
+
+  {
+    "from": "src/components/Widget",
+    "to": "src/features/widgets/WidgetCard",
+    "renameSymbols": [
+      {"old": "Widget", "new": "WidgetCard"},
+      {"old": "WidgetProps", "new": "WidgetCardProps"},
+      {"old": "useWidget", "new": "useWidgetCard"}
+    ]
+  },
+
+  ["src/components/Spinner.tsx", "src/components/ui/Loader.tsx"],
+
+  {
+    "from": "src/components/legacy/OldButton",
+    "to": "src/components/ui/Button",
+    "renameSymbols": []
+  }
+]
