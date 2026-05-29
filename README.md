@@ -17,14 +17,18 @@ You write JSON describing what should be where. The tool:
 - Rewrites every `import` across the project, both `@/`-aliased and relative
 - Renames matching identifiers (and their references) via the TypeScript LS
 - Carries sibling `.module.scss` / `.module.css` along
-- Extracts top-level symbols into new files via TS LS "Move to a new file"
+- Extracts top-level symbols into new files via TS LS "Move to a new file";
+  retries through a patched LS (`@cevek/typescript-extract-refactor-fix`)
+  when stock TS hits its `Expected symbol to be a module` assertion
 - Co-extracts the CSS classes that block uses (safe-only)
 - Type-checks before AND after; refuses to start if the project already
-  fails, refuses if the git tree is dirty
+  fails, refuses if the git tree is dirty in `--apply`
 - Runs the project's prettier over every touched file
+- Writes a unified-diff `.patch` of the full result to a temp file
 
-Real-world: **129 ops, 62 applied, post-typecheck clean, ~32 s** end-to-end
-including two full project type-checks and prettier.
+Real-world: **129 ops, 129 applied (67 rescued via the patched TS LS),
+post-typecheck clean, ~50 s** end-to-end including two full project
+type-checks and prettier across ~310 files.
 
 ## Install / run
 
@@ -110,18 +114,32 @@ Extra vars in this context: `{symbol}` (the extract name) and `{dir}`
 template literal — same vars, applied per-op.
 
 **Extract caveats.** Extract delegates to the TS language service.
-If TS can't perform "Move to a new file" / "Move to file" for a symbol
-(LS internal assertion, no edits produced, etc.) the op fails cleanly
-with a grouped report — extract that symbol manually. The tool never
-invents its own extract logic.
+If TS can't perform "Move to a new file" / "Move to file" for a symbol,
+the tool retries through a patched LS
+(`@cevek/typescript-extract-refactor-fix`) that addresses the well-known
+`Expected symbol to be a module` assertion. Rescued ops appear in the
+stage log as `↻ N rescued via patched TS LS` and are counted in the
+report under `ops.rescuedByFallback`. If the patched LS also can't
+handle the shape, the op fails cleanly with a grouped report — extract
+that symbol manually. The tool never invents its own extract logic.
+
+**Auto-coerce `.ts` → `.tsx`.** Extract ops whose body contains JSX but
+whose `to` ends in `.ts` get rewritten to `.tsx` automatically — your
+ops.json doesn't have to peek inside the file to know it returns JSX.
+The stage log lists every coerced op (`↻ auto-coerced N op(s) …`) and
+the JSON report carries them under `coercions[]`. Grouping is per-
+destination: if two ops target the same `helpers.ts` and only one has
+JSX, BOTH get coerced so they still merge into the same file.
 
 **CSS co-extract (`"css": "copy-safe"`).** The tool walks the source's
 sibling stylesheet, figures out which classes the extracted block uses,
 moves the **provably safe** ones into a fresh stylesheet next to the
 extracted file. Anything ambiguous (compound selectors, `@include`,
 `@extend`, value interpolation) stays in the original — references get
-rewritten to `sLegacy.X`. A per-class moved/left-behind report prints
-at the end. **Diff and visual-test before merging.**
+rewritten to `sLegacy.X`. A per-class report prints at the end with
+short codes (`USED` / `NO-RULE` / `COMPOUND` / `NESTED` / `AT-RULE` /
+`SASS-VAR` / `EXTEND` / `NEST-PARENT` / `ALIAS-IMP`) and a one-line
+legend at the bottom. **Diff and visual-test before merging.**
 
 ## CLI
 
@@ -174,36 +192,54 @@ front-renamer (dry-run)
   ts        6.0.3 (project)         ← resolved from project's node_modules
 
 ✓ 129 op(s) validated
+↻ auto-coerced 5 op(s) .ts → .tsx (body contains JSX)
+    op#37  content        features/.../helpers.ts → helpers.tsx
+    op#40  renderWebsite  features/.../helpers.ts → helpers.tsx
+    ...
 ✓ pre-typecheck clean
 ✓ plan: 5 phase(s)
-✓ applied 62/129 op(s) in-memory
-✓ imports rewritten in 68 file(s)
-✓ prettier 3.8.3 (122 file(s) formatted)
-· dry-run — not writing to disk
+✓ applied 129/129 op(s) in-memory
+  ↻ 67 rescued via patched TS LS
+✓ imports rewritten in 74 file(s)
+✓ prettier 3.8.3 (314 file(s) formatted)
+✓ diff written to /tmp/front-renamer-2026-05-29T13-38-37Z.patch
 ✓ post-typecheck clean (in-memory overlay)
 
 === summary ===
 phases:           5
 ops total:        129
-  ✓ applied:      62  (moves: 0, moves+rename: 0, extracts: 62)
-  ✗ failed:       67
-files with edits: 122
-diff:             /tmp/front-renamer-2026-05-29T13-38-37Z.patch
+  ✓ applied:      129  (moves: 0, moves+rename: 0, extracts: 129)
+  ✗ failed:       0
+files with edits: 314
+CSS classes:      330 across 64 stylesheet(s)
+  ✓ moved:        233
+  ✗ left behind:  97
 
-=== ✓ applied ops (62) ===
-  extracts (62):
+=== ✓ applied ops (129) ===
+  extracts (129):
     op#3   toTitleCase       components/.../AutoStatusPill.tsx → helpers.ts
     op#5   FormBody          components/.../FormLayout.tsx     → FormBody.tsx
     ...
 
-=== ✗ failed ops (67, 1 cause) ===
-  TS LS internal assertion ("Expected symbol to be a module") — extract these manually — 67 op(s):
-    op#0   IconDropdown      components/.../AppearancePicker.tsx → IconDropdown.tsx
-    ...
+=== CSS co-extract ===
+
+  components/.../AppearancePicker.module.scss → ColorDropdown.module.scss
+    moved: .swatch  .chevron  .grid
+    left:  .trigger NESTED  .menu COMPOUND  .tile NO-RULE
+
+  legend:
+    NESTED    rule has nested child rules
+    COMPOUND  appears in a compound selector elsewhere
+    NO-RULE   no matching CSS rule found
+
+✓ done (50.2s)  (log: /tmp/front-renamer-log-2026-05-29T...log)
 ```
 
-Diff is written to one temp file in unified format (`git diff`-style
-sections per file). The console shows the path, not the content.
+The full console output is mirrored to a temp `.log` file when
+`--report-json` isn't set — path printed alongside `done` so you can
+re-read a run without rerunning. Diff is written to a separate temp
+`.patch` file in unified format (`git diff`-style sections per file).
+The console shows the paths, never the content.
 
 ## Machine-readable report
 
@@ -227,10 +263,13 @@ jq '[.failed[] | select(.kind == "extract")
 ```
 
 Top-level keys: `version`, `mode`, `startedAt`, `elapsedMs`, `exitCode`,
-`project` (root / tsconfig / ts / prettier metadata), `ops` (counts +
-breakdown by kind), `applied[]`, `failed[]` (with `category`, `error`,
-`context`, `docs`), `warnings[]`, `imports`, `prettier`, `cssReports[]`,
-`diff`, `rollback`.
+`project` (root / tsconfig / ts / prettier metadata), `ops` (counts —
+including `rescuedByFallback` — and breakdown by kind), `applied[]`,
+`failed[]` (with `category`, `error`, `context`, `docs`), `warnings[]`,
+`coercions[]` (auto-coerced `.ts` → `.tsx` records), `imports`, `prettier`
+(with per-file `failed[]`), `css` (aggregate `moved`/`leftBehind`/`sheets`),
+`cssReports[]` (with `leftBehind[].code`/`detail`/`reason`), `diff`,
+`rollback`.
 
 ## What's resolved from the project
 

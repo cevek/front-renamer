@@ -64,6 +64,33 @@ export function tsInfo(): {from: 'project' | 'bundled'; version: string} {
     return {from: resolvedFrom, version: resolvedVersion};
 }
 
+/**
+ * Load `@cevek/typescript-extract-refactor-fix` — a patched TS that fixes the
+ * `Expected symbol to be a module` assertion the stock LS throws on common
+ * extract patterns (component-with-deep-alias-imports, row-from-table, etc).
+ *
+ * The patched module is a typescript drop-in (same default export shape), so
+ * the caller can build a parallel `LanguageService` and reuse the host
+ * factory unchanged. Returns the namespace directly, or null when the package
+ * isn't installed (older installs / opt-out).
+ *
+ * Looked up here (front-renamer's own node_modules) — NOT in the project —
+ * because the fix package is OUR dependency, not the user's.
+ */
+export function loadExtractFallbackTs(): typeof bundledTs | null {
+    try {
+        // Anchor on this module's location so we resolve our own dep, not the
+        // user project's. `import.meta.url` is stable across CJS/ESM builds.
+        const here = new URL('.', import.meta.url).pathname;
+        const req = createRequire(path.join(here, 'package.json'));
+        const fix = req('@cevek/typescript-extract-refactor-fix') as typeof bundledTs;
+        if (typeof fix.createLanguageService !== 'function') return null;
+        return fix;
+    } catch {
+        return null;
+    }
+}
+
 // ---------- the `ts` export — value + type in one identifier ----------
 
 // Re-export the bundled typescript namespace under name `ts`. This gives us

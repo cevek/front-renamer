@@ -20,7 +20,7 @@ import type {ProjectInfo} from './preflight.js';
 import {VFSTree, type FsNode} from './vfs.js';
 import {RenameEngine} from './rename.js';
 import {rewriteImportsInFile} from './imports.js';
-import {ExtractEngine, ExtractFailure} from './extract.js';
+import {DeferredExtract, ExtractEngine, ExtractFailure} from './extract.js';
 
 export class Engine {
     readonly tree: VFSTree;
@@ -69,6 +69,11 @@ export class Engine {
                     else this.applyMoveToTree(op);
                     this.appliedOps.push(op);
                 } catch (err) {
+                    // Deferred extract — neither success nor failure yet.
+                    // The op is parked in ExtractEngine.pendingFallback and
+                    // will be retried in `flushPendingFallback` at the end of
+                    // this method. Don't push to appliedOps OR opFailures.
+                    if (err instanceof DeferredExtract) continue;
                     // Always record the failure with structured metadata so
                     // the CLI's `printFailureReport` renders it through the
                     // same grouped path it uses for continue-mode batches.
@@ -88,6 +93,24 @@ export class Engine {
                 }
             }
         }
+
+        // Batched fallback pass — all ops that hit the stock LS' assertion
+        // get one consolidated run through the patched LS here. Done after
+        // the main loop completes so the patched LS' program is synced once
+        // against the final stock-LS-modified VFS (O(N) sync) instead of
+        // catching up on every interleaved stock-LS edit (O(N×M)).
+        this.extracts?.flushPendingFallback({
+            onApplied: (op) => this.appliedOps.push(op),
+            onFailed: (op, category, context) => {
+                this.opFailures.push({
+                    index: op.index,
+                    op,
+                    error: `[${category}] op#${op.index} ${op.extract}: ${context}`,
+                    category,
+                    context,
+                });
+            },
+        });
 
         // ---- Identifier renames run after all tree mutations: they're driven
         // through the TS language service and don't care about physical layout. ----
@@ -158,6 +181,14 @@ export class Engine {
     }
 
     /**
+     * How many ops the patched-TS fallback rescued. 0 when the package isn't
+     * installed OR no op tripped the assertion.
+     */
+    get rescuedByFallback(): number {
+        return this.extracts?.rescuedByFallback ?? 0;
+    }
+
+    /**
      * Run prettier across every file the batch touched (content overrides or
      * relocations) — keeps the diff small AND consistent with the project's
      * own style. Returns a count of files formatted; skipped files (ignored or
@@ -215,6 +246,13 @@ export class Engine {
             const moved = node.currentPath() !== node.initialPath();
             const edited = node.hasContentOverride();
             if (!moved && !edited) continue;
+            // Only TS/JS modules belong in the typecheck program. CSS module
+            // co-extract edits sibling `.module.scss` files; including those
+            // in the overlay drags them into the root file list and TS rejects
+            // them with TS6054 ("unsupported extension"). Asset-style files
+            // (CSS / images / JSON) participate in the build via import
+            // resolution at the consumer site, not as standalone roots.
+            if (!/\.(tsx?|jsx?|d\.ts|d\.mts|d\.cts|mts|cts)$/i.test(node.currentName)) continue;
             out.push({
                 path: node.currentPath(),
                 content: node.readContent(),

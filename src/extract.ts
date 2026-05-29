@@ -18,7 +18,7 @@
  */
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
-import {ts} from './ts-loader.js';
+import {loadExtractFallbackTs, ts} from './ts-loader.js';
 import type {NormalizedExtractOp} from './schema.js';
 import type {ProjectInfo} from './preflight.js';
 import {VFSTree} from './vfs.js';
@@ -54,6 +54,20 @@ export class ExtractFailure extends Error {
     }
 }
 
+/**
+ * Thrown when the stock LS hit the `Expected symbol to be a module` assertion
+ * AND a patched-LS fallback is available. The op is parked in
+ * `pendingFallback` to be retried in a single batched pass at the end of
+ * `applyToVFS` — see `ExtractEngine.flushPendingFallback`. This is NOT a
+ * failure: the engine should neither record success NOR push to opFailures
+ * until the fallback runs.
+ */
+export class DeferredExtract extends Error {
+    constructor(readonly op: NormalizedExtractOp) {
+        super(`deferred extract op#${op.index} ${op.extract} — pending fallback LS`);
+    }
+}
+
 export class ExtractEngine {
     private service: ts.LanguageService;
     private versions = new Map<string, number>();
@@ -73,6 +87,29 @@ export class ExtractEngine {
      */
     readonly warnings: Array<{index: number; symbol: string; from: string; to: string; reason: string}> = [];
 
+    /**
+     * Lazy-loaded parallel LS backed by `@cevek/typescript-extract-refactor-fix`
+     * — a patched TS that fixes the `Expected symbol to be a module`
+     * assertion. We only construct it on first need (one TS install + LS init
+     * costs ~150ms, no point paying that when nothing in the batch trips the
+     * assert). `null` after first attempt means the package isn't installed
+     * → fallback is unavailable for this run.
+     */
+    private fallbackService: ts.LanguageService | null = null;
+    private fallbackInit: 'pending' | 'loaded' | 'unavailable' = 'pending';
+    /** Counter for the report — how many ops were rescued by the patched LS. */
+    rescuedByFallback = 0;
+    /**
+     * Ops whose stock-LS extract hit the `Expected symbol to be a module`
+     * assertion. We collect them during the main pass and retry through the
+     * patched LS in a SINGLE batched pass at the end. Why batched: with N
+     * stock-LS extracts interleaved with M patched-LS retries, the patched LS
+     * has to re-sync its program against EVERY change made by stock between
+     * retries → O(N×M) sync work. Doing all stock first, then all patched,
+     * collapses that to O(N + M).
+     */
+    private pendingFallback: NormalizedExtractOp[] = [];
+
     constructor(
         readonly project: ProjectInfo,
         private tree: VFSTree,
@@ -80,13 +117,20 @@ export class ExtractEngine {
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
         _renames: RenameEngine,
     ) {
-        const sourceFiles = new Set(project.sourceFiles);
-        // VFS-first host: TS LS sees any file/dir living in the tree as if it
-        // existed on disk. Lets us run "Move to file" against synthesised
-        // targets without ever writing a physical stub — the IDE no longer
-        // flashes ghost files mid-run, and dry-mode is truly zero-write.
-        const host: ts.LanguageServiceHost = {
-            getCompilationSettings: () => project.compilerOptions,
+        this.service = ts.createLanguageService(this.buildHost(ts), ts.createDocumentRegistry());
+    }
+
+    /**
+     * Build a VFS-aware `LanguageServiceHost` parameterised on a typescript
+     * namespace. Pulled out so we can construct a SECOND LS from the patched
+     * TS (`loadExtractFallbackTs`) without copy-pasting the host. Uses the
+     * given namespace's `ScriptSnapshot`/`sys`/`getDefaultLibFilePath` so the
+     * patched LS doesn't cross-contaminate with the stock module's internals.
+     */
+    private buildHost(tsNs: typeof ts): ts.LanguageServiceHost {
+        const sourceFiles = new Set(this.project.sourceFiles);
+        return {
+            getCompilationSettings: () => this.project.compilerOptions,
             getScriptFileNames: () => {
                 // Original tsconfig roots PLUS any new path we synthesised
                 // (extract targets, retargeted files). De-dup on canonical key.
@@ -99,10 +143,10 @@ export class ExtractEngine {
             getScriptVersion: (fileName) => String(this.versions.get(fileName) ?? 0),
             getScriptSnapshot: (fileName) => {
                 const text = this.readByInitialPath(fileName);
-                return text !== null ? ts.ScriptSnapshot.fromString(text) : undefined;
+                return text !== null ? tsNs.ScriptSnapshot.fromString(text) : undefined;
             },
-            getCurrentDirectory: () => project.root,
-            getDefaultLibFileName: ts.getDefaultLibFilePath,
+            getCurrentDirectory: () => this.project.root,
+            getDefaultLibFileName: tsNs.getDefaultLibFilePath,
             fileExists: (p) => {
                 const byInit = this.tree.findByInitialPath(p);
                 if (byInit && byInit.kind === 'file') return true;
@@ -119,10 +163,167 @@ export class ExtractEngine {
                 if (node && node.kind === 'dir') return true;
                 return safeStat(p)?.isDirectory() ?? false;
             },
-            getDirectories: ts.sys.getDirectories,
-            realpath: ts.sys.realpath,
+            getDirectories: tsNs.sys.getDirectories,
+            realpath: tsNs.sys.realpath,
         };
-        this.service = ts.createLanguageService(host, ts.createDocumentRegistry());
+    }
+
+    /**
+     * On first call, attempt to load the patched TS and stand up a parallel
+     * LS. Subsequent calls return the cached service (or null if unavailable).
+     * Idempotent and cheap on the hot path.
+     */
+    private getFallbackService(): ts.LanguageService | null {
+        if (this.fallbackInit !== 'pending') return this.fallbackService;
+        const fixTs = loadExtractFallbackTs();
+        if (!fixTs) {
+            this.fallbackInit = 'unavailable';
+            return null;
+        }
+        this.fallbackService = fixTs.createLanguageService(
+            this.buildHost(fixTs),
+            fixTs.createDocumentRegistry(),
+        );
+        this.fallbackInit = 'loaded';
+        return this.fallbackService;
+    }
+
+    /**
+     * Single batched pass through the patched LS for every op that was
+     * deferred during the main extract loop. Caller (the Engine) passes a
+     * resolver that decides what to do per outcome — applied OR failed —
+     * so the Engine can update its own `appliedOps` / `opFailures` lists
+     * without ExtractEngine reaching into them.
+     *
+     * Doing this once at the end is the perf win: the patched LS' program is
+     * synced ONCE against the final stock-LS-modified VFS, then each retry
+     * adds one file's worth of delta. Interleaved retries would force the
+     * patched LS to catch up on every stock-LS edit it missed — O(N×M)
+     * sync work for N stock + M patched ops.
+     */
+    flushPendingFallback(resolver: {
+        onApplied: (op: NormalizedExtractOp) => void;
+        onFailed: (op: NormalizedExtractOp, category: ExtractFailureCategory, context: string) => void;
+    }): void {
+        if (this.pendingFallback.length === 0) return;
+        const fallback = this.getFallbackService();
+        if (!fallback) {
+            // Defensive — shouldn't happen because we only defer when the
+            // package is available. If something nuked it between then and
+            // now, surface every pending op as a real failure.
+            for (const op of this.pendingFallback) resolver.onFailed(op, 'ts-ls-internal', 'fallback service vanished');
+            this.pendingFallback.length = 0;
+            return;
+        }
+        const ops = [...this.pendingFallback];
+        this.pendingFallback.length = 0;
+        for (const op of ops) {
+            try {
+                this.runOneExtract(op, fallback);
+                this.rescuedByFallback++;
+                resolver.onApplied(op);
+            } catch (err) {
+                if (err instanceof ExtractFailure) {
+                    resolver.onFailed(op, err.category, err.context);
+                } else if (isTsLsAssertion(err)) {
+                    resolver.onFailed(op, 'ts-ls-internal', (err as Error).message ?? '');
+                } else {
+                    // Non-assertion throw — re-surface; not part of the
+                    // patched-fix contract.
+                    throw err;
+                }
+            }
+        }
+    }
+
+    /**
+     * Run a single extract op through `service` and apply its result. Pulled
+     * out so the batched fallback pass and the main `extract()` can share
+     * the same apply / post-process pipeline.
+     */
+    private runOneExtract(op: NormalizedExtractOp, service: ts.LanguageService): void {
+        // The whole `extract(op)` body relies on member state and runs the
+        // stock service. For fallback we just re-issue the refactor through
+        // the chosen service, then reuse the same apply path. Cleaner than
+        // forking the entire method.
+        const fromNode = this.tree.findByInitialPath(op.fromAbs);
+        if (!fromNode) {
+            throw new Error(`extract op#${op.index}: source file not in tree: ${op.from}`);
+        }
+        const targetNode = this.tree.findByInitialPath(op.toAbs) ?? this.tree.findByCurrentPath(op.toAbs);
+        const intoExisting = targetNode !== null;
+        if (intoExisting) this.bumpVersion(op.toAbs);
+
+        const sourceKind = /\.tsx$/i.test(op.fromAbs) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+        const sf = ts.createSourceFile(
+            fromNode.initialPath(),
+            fromNode.readContent(),
+            ts.ScriptTarget.Latest,
+            true,
+            sourceKind,
+        );
+        const declarationPos = this.findDeclarationPosition(sf, op.extract);
+        if (declarationPos === null) {
+            throw new Error(
+                `extract op#${op.index}: symbol "${op.extract}" not found as a top-level declaration in ${op.from}`,
+            );
+        }
+        const preferences: ts.UserPreferences = {allowTextChangesInNewFiles: true};
+        const declStatement = findDeclarationStatement(sf, op.extract);
+        const range: ts.TextRange = declStatement
+            ? {pos: declStatement.getStart(sf), end: declStatement.getEnd()}
+            : {pos: declarationPos, end: declarationPos};
+
+        const edits = this.callRefactor(service, fromNode, range, preferences, op, intoExisting);
+        if (!edits || edits.edits.length === 0) {
+            throw new ExtractFailure(
+                intoExisting ? 'ts-ls-no-edits-move-to-file' : 'ts-ls-declined-move-to-new-file',
+                op,
+                '',
+            );
+        }
+        this.applyExtractEdits(op, edits, intoExisting, sf);
+    }
+
+    /**
+     * Issue the actual `getEditsForRefactor` call. Pulled out so we can drive
+     * BOTH the stock LS and the patched fallback LS through the same shape —
+     * the retry logic in `extract()` only needs to swap the service argument.
+     * Returns null when the LS produced no edits; caller distinguishes that
+     * from the assertion-throw path.
+     */
+    private callRefactor(
+        service: ts.LanguageService,
+        fromNode: FsNode,
+        range: ts.TextRange,
+        preferences: ts.UserPreferences,
+        op: NormalizedExtractOp,
+        intoExisting: boolean,
+    ): ts.RefactorEditInfo | null {
+        const fmt: ts.FormatCodeSettings = {convertTabsToSpaces: true, tabSize: 2, indentSize: 2};
+        if (intoExisting) {
+            return (
+                service.getEditsForRefactor(
+                    fromNode.initialPath(),
+                    fmt,
+                    range,
+                    'Move to file',
+                    'Move to file',
+                    preferences,
+                    {targetFile: op.toAbs},
+                ) ?? null
+            );
+        }
+        return (
+            service.getEditsForRefactor(
+                fromNode.initialPath(),
+                fmt,
+                range,
+                'Move to a new file',
+                'Move to a new file',
+                preferences,
+            ) ?? null
+        );
     }
 
     /**
@@ -208,48 +409,70 @@ export class ExtractEngine {
             ? {pos: declStatement.getStart(sf), end: declStatement.getEnd()}
             : {pos: declarationPos, end: declarationPos};
 
-        let edits: ts.RefactorEditInfo | undefined;
-        try {
-            if (intoExisting) {
-                edits = this.service.getEditsForRefactor(
-                    fromNode.initialPath(),
-                    {convertTabsToSpaces: true, tabSize: 2, indentSize: 2},
-                    range,
-                    'Move to file',
-                    'Move to file',
-                    preferences,
-                    {targetFile: op.toAbs},
-                );
-                if (!edits || edits.edits.length === 0) {
-                    throw new ExtractFailure('ts-ls-no-edits-move-to-file', op, '');
-                }
-            } else {
-                edits = this.service.getEditsForRefactor(
-                    fromNode.initialPath(),
-                    {convertTabsToSpaces: true, tabSize: 2, indentSize: 2},
-                    range,
-                    'Move to a new file',
-                    'Move to a new file',
-                    preferences,
-                );
-                if (!edits || edits.edits.length === 0) {
-                    throw new ExtractFailure('ts-ls-declined-move-to-new-file', op, '');
-                }
-            }
-        } catch (err) {
-            const message = (err as Error).message ?? String(err);
-            if (
-                message.includes('Expected symbol to be a module') ||
-                message.includes('Debug Failure')
-            ) {
-                // Throw a structured failure — the CLI groups by category and
-                // prints a single short line per op (the long verbose form just
-                // burns tokens when 60+ ops share the same root cause).
-                throw new ExtractFailure('ts-ls-internal', op, buildExtractFailureContext(sf, op));
-            }
-            throw err;
+        // Pre-flight: if the symbol's body contains JSX but the destination
+        // ends in .ts (not .tsx), the resulting file won't parse — TS1294 /
+        // TS1110 / TS1005 cascade in post-typecheck. Surface it BEFORE running
+        // the refactor so the user sees a clear, actionable warning instead
+        // of digging through parser errors. Auto-coercion would be invasive
+        // (other ops in the batch might target the same .ts file) — we warn
+        // and leave the fix to the user.
+        if (declStatement && /\.ts$/.test(op.toAbs) && containsJsx(declStatement)) {
+            this.warnings.push({
+                index: op.index,
+                symbol: op.extract,
+                from: op.from,
+                to: op.to,
+                reason: `symbol body contains JSX but destination ends in ".ts" — rename "to" to ".tsx" or the file won't parse`,
+            });
         }
 
+        // Run the refactor through the stock LS first. On the stock-LS
+        // `Expected symbol to be a module` assert, retry through the patched
+        // LS (@cevek/typescript-extract-refactor-fix) — the assert is a TS
+        // bug that the fix patches. We don't retry the "no-edits" / "declined"
+        // categories: those have different root causes (target file ambiguity,
+        // single-statement source) that the patch doesn't address.
+        let edits: ts.RefactorEditInfo | null = null;
+        try {
+            edits = this.callRefactor(this.service, fromNode, range, preferences, op, intoExisting);
+        } catch (err) {
+            if (!isTsLsAssertion(err)) throw err;
+            // If a patched LS is available, defer this op and retry it in a
+            // single batched pass at the end. If not, surface as failure now.
+            // Loading the patched module is cheap (lazy require + duck-check);
+            // we use the loader result as a yes/no probe without instantiating
+            // a LanguageService yet — that work happens once in flushPendingFallback.
+            if (!loadExtractFallbackTs()) {
+                throw new ExtractFailure('ts-ls-internal', op, buildExtractFailureContext(sf, op));
+            }
+            this.pendingFallback.push(op);
+            throw new DeferredExtract(op);
+        }
+        // Empty-edit categories — neither the stock nor the patched LS would
+        // produce edits for these shapes; retry doesn't help.
+        if (!edits || edits.edits.length === 0) {
+            throw new ExtractFailure(
+                intoExisting ? 'ts-ls-no-edits-move-to-file' : 'ts-ls-declined-move-to-new-file',
+                op,
+                '',
+            );
+        }
+
+        this.applyExtractEdits(op, edits, intoExisting, sf);
+    }
+
+    /**
+     * Apply the refactor edits returned by either stock OR patched LS to the
+     * VFS, then run the consumer-fix-up + CSS co-extract + symbol-move
+     * tracking. Pulled out of `extract()` so the batched fallback pass can
+     * reuse the exact same pipeline.
+     */
+    private applyExtractEdits(
+        op: NormalizedExtractOp,
+        edits: ts.RefactorEditInfo,
+        intoExisting: boolean,
+        sf: ts.SourceFile,
+    ): void {
         // Dedup edits by VFS-node identity BEFORE applying. The LS may emit
         // two edits for one logical file when the file was previously
         // synthesised under a different name (e.g. op#N created `Foo.tsx`
@@ -358,6 +581,10 @@ export class ExtractEngine {
         // Track the symbol move so the post-pass can fix consumers the LS missed
         // (e.g. files synthesised by an earlier extract op in this same batch).
         this.extractedSymbols.push({symbol: op.extract, fromAbs: op.fromAbs, toAbs: op.toAbs});
+        // Silence unused-param lint — `sf` is captured for future failure
+        // diagnostics (apply-time problems benefit from the same context as
+        // refactor-time ones).
+        void sf;
     }
 
     /**
@@ -410,6 +637,35 @@ export class ExtractEngine {
  * description, or null if nothing to warn about.
  */
 /** Collect enough surface info about a failed extract to triage the cause. */
+/**
+ * True when the subtree contains any JSX node (element, self-closing, fragment).
+ * Used pre-extract to warn when the destination ends in `.ts` — TS rejects JSX
+ * in `.ts` files; only `.tsx` parses it.
+ */
+function containsJsx(node: ts.Node): boolean {
+    let found = false;
+    const walk = (n: ts.Node): void => {
+        if (found) return;
+        if (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n) || ts.isJsxFragment(n)) {
+            found = true;
+            return;
+        }
+        ts.forEachChild(n, walk);
+    };
+    walk(node);
+    return found;
+}
+
+/**
+ * Recognise the TS LS "Expected symbol to be a module" assertion (or any
+ * `Debug Failure`) — the signal that the refactor hit the documented bug
+ * and might be salvageable via the patched fallback LS.
+ */
+function isTsLsAssertion(err: unknown): boolean {
+    const msg = (err as Error)?.message ?? String(err);
+    return msg.includes('Expected symbol to be a module') || msg.includes('Debug Failure');
+}
+
 function buildExtractFailureContext(sf: ts.SourceFile, op: NormalizedExtractOp): string {
     let aliasImports = 0;
     let relativeImports = 0;

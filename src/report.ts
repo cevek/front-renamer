@@ -36,6 +36,8 @@ export interface RunReport {
         input: number;
         applied: number;
         failed: number;
+        /** Subset of `applied`: extracts the stock LS refused but the patched LS rescued. */
+        rescuedByFallback: number;
         byKind: {move: number; moveWithRename: number; extract: number};
     };
 
@@ -58,16 +60,49 @@ export interface RunReport {
         | {available: true; version: string; formatted: number; skipped: number; failed: Array<{path: string; reason: string}>}
         | {available: false; reason: string};
 
+    /**
+     * Aggregate CSS counts — same numbers as the stage-log summary line.
+     * Lets CI gate on `.css.leftBehind > 0` without iterating the per-sheet
+     * `cssReports[]` array. `sheets` is the number of `cssReports[]` entries.
+     */
+    css: {
+        moved: number;
+        leftBehind: number;
+        sheets: number;
+    };
+
     cssReports: Array<{
         sourceStylesheet: string;
         targetStylesheet: string | null;
         moved: string[];
-        leftBehind: Array<{class: string; reason: string}>;
+        leftBehind: Array<{
+            class: string;
+            /** Short stable code (see docs / CLI legend). */
+            code: string;
+            /** Parameterised codes (e.g. AT-RULE: "@include"). */
+            detail?: string;
+            /** Long-form English. Stable enough for grep but secondary to `code`. */
+            reason: string;
+        }>;
     }>;
 
     diff: {path: string} | null;
 
     rollback: {armed: boolean; sha: string | null};
+
+    /**
+     * Extract ops whose destination was auto-coerced from `.ts` to `.tsx`
+     * because the symbol body contains JSX. Empty when nothing needed fixing.
+     * Lets a tooling/CI consumer detect "the tool patched your ops.json"
+     * without having to diff `applied[].to` against the input.
+     */
+    coercions: Array<{
+        index: number;
+        symbol: string;
+        from: string;
+        oldTo: string;
+        newTo: string;
+    }>;
 }
 
 interface AppliedMove {
@@ -126,6 +161,7 @@ export interface BuildReportInput {
         | {available: true; version: string; formatted: number; skipped: number; failed: Array<{path: string; reason: string}>}
         | {available: false; reason: string};
     rollback: {armed: boolean; sha: string | null};
+    coercions: RunReport['coercions'];
     docsUrlFor: (category: string) => string | null;
 }
 
@@ -184,6 +220,7 @@ export function buildRunReport(input: BuildReportInput): RunReport {
             input: engine.appliedOps.length + engine.opFailures.length,
             applied: engine.appliedOps.length,
             failed: engine.opFailures.length,
+            rescuedByFallback: engine.rescuedByFallback,
             byKind: {
                 move: moves.length,
                 moveWithRename: movesWithRename.length,
@@ -195,14 +232,28 @@ export function buildRunReport(input: BuildReportInput): RunReport {
         warnings,
         imports: {filesRewritten: input.importsFilesRewritten},
         prettier: input.prettier,
+        css: {
+            // Rolled up from `cssReports[]` — same numbers as the stage-log
+            // summary line. Saves CI consumers from having to fold the array
+            // themselves to gate on "did anything end up left-behind?".
+            moved: engine.cssReports.reduce((n, r) => n + r.moved.length, 0),
+            leftBehind: engine.cssReports.reduce((n, r) => n + r.leftBehind.length, 0),
+            sheets: engine.cssReports.length,
+        },
         cssReports: engine.cssReports.map((r) => ({
             sourceStylesheet: r.sourceStylesheet,
             targetStylesheet: r.targetStylesheet ?? null,
             moved: [...r.moved],
-            leftBehind: r.leftBehind.map((lb) => ({class: lb.class, reason: lb.reason})),
+            leftBehind: r.leftBehind.map((lb) => ({
+                class: lb.class,
+                code: lb.code,
+                detail: lb.detail,
+                reason: lb.reason,
+            })),
         })),
         diff: input.diffPath ? {path: input.diffPath} : null,
         rollback: input.rollback,
+        coercions: input.coercions,
     };
 }
 

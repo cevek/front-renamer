@@ -34,12 +34,34 @@ import type {FsNode, VFSTree} from './vfs.js';
 import {applyEdits} from './text-edits.js';
 import {toRelativeImportSpec} from './module-resolve.js';
 
+/**
+ * Reason codes for why a class wasn't moved. Codes are short for compact
+ * terminal output; the printer keeps the legend so users don't have to
+ * memorise them.
+ */
+export type LeftBehindCode =
+    | 'USED'         // still referenced by the source-file remainder
+    | 'NO-RULE'      // no matching CSS rule in the source stylesheet
+    | 'COMPOUND'     // class appears in a compound selector elsewhere
+    | 'NESTED'       // owning rule has nested child rules
+    | 'NEST-PARENT'  // owning rule is itself nested inside another selector
+    | 'AT-RULE'      // owning rule body uses @include / @function / @mixin / etc
+    | 'SASS-VAR'     // owning rule references a Sass variable in declarations
+    | 'EXTEND'       // class is referenced by @extend somewhere
+    | 'ALIAS-IMP';   // import in the TS code uses a path alias we don't resolve
+
 export interface CssCoExtractReport {
     sourceStylesheet: string;
     targetStylesheet: string;
     moved: string[];
-    /** class → reason */
-    leftBehind: Array<{class: string; reason: string}>;
+    leftBehind: Array<{
+        class: string;
+        code: LeftBehindCode;
+        /** Optional parameter — e.g. the at-rule name for AT-RULE. */
+        detail?: string;
+        /** Long-form English explanation; kept for JSON consumers / docs. */
+        reason: string;
+    }>;
 }
 
 export interface CssCoExtractOptions {
@@ -119,6 +141,8 @@ export function coExtractCssModules(opts: CssCoExtractOptions): CssCoExtractRepo
                 leftBehind: [
                     {
                         class: '*',
+                        code: 'ALIAS-IMP',
+                        detail: currentImp.specifier,
                         reason: `aliased import "${currentImp.specifier}" — resolve manually`,
                     },
                 ],
@@ -157,13 +181,13 @@ export function coExtractCssModules(opts: CssCoExtractOptions): CssCoExtractRepo
         }
 
         const moved: string[] = [];
-        const leftBehind: Array<{class: string; reason: string}> = [];
+        const leftBehind: CssCoExtractReport['leftBehind'] = [];
 
         for (const cls of refsInExtracted) {
             const stillUsedInRemaining = remainingIsWildcard || refsInRemaining.has(cls);
-            const verdict = isClassSafeToMove(root, cls, stillUsedInRemaining);
+            const verdict = classSafetyVerdict(root, cls, stillUsedInRemaining);
             if (verdict === 'safe') moved.push(cls);
-            else leftBehind.push({class: cls, reason: verdict});
+            else leftBehind.push({class: cls, ...verdict});
         }
         if (moved.length === 0 && leftBehind.length === 0) continue;
 
@@ -275,16 +299,35 @@ function collectMemberAccesses(
 ): void {
     // Permissive variant: only literal `s.X` / `s['X']` (used for the EXTRACTED file
     // since we generated its content from TS LS and don't have weird patterns).
+    //
+    // Scope-aware: skip subtrees where a function parameter (or catch
+    // variable) shadows the CSS-import name. E.g. zustand's
+    // `useStore((s) => s.field)` — the inner `s` is the lambda parameter,
+    // not the CSS module. Collecting `s.field` here would mark it as a
+    // candidate CSS class and pollute the report (`.field NO-RULE`).
     const names = new Set(localNames);
-    const visit = (node: ts.Node) => {
+    const visit = (node: ts.Node, shadowedSet: Set<string>): void => {
+        // Functions/catch may add new shadows for this subtree.
+        const nodeShadows = collectShadowedNames(node, names);
+        const subtreeShadowed =
+            nodeShadows.size > 0 ? new Set([...shadowedSet, ...nodeShadows]) : shadowedSet;
+
         if (ts.isPropertyAccessExpression(node)) {
-            if (ts.isIdentifier(node.expression) && names.has(node.expression.text)) {
+            if (
+                ts.isIdentifier(node.expression) &&
+                names.has(node.expression.text) &&
+                !shadowedSet.has(node.expression.text)
+            ) {
                 const set = out.get(node.expression.text) ?? new Set<string>();
                 set.add(node.name.text);
                 out.set(node.expression.text, set);
             }
         } else if (ts.isElementAccessExpression(node)) {
-            if (ts.isIdentifier(node.expression) && names.has(node.expression.text)) {
+            if (
+                ts.isIdentifier(node.expression) &&
+                names.has(node.expression.text) &&
+                !shadowedSet.has(node.expression.text)
+            ) {
                 const arg = node.argumentExpression;
                 if (arg && ts.isStringLiteral(arg)) {
                     const set = out.get(node.expression.text) ?? new Set<string>();
@@ -293,9 +336,39 @@ function collectMemberAccesses(
                 }
             }
         }
-        ts.forEachChild(node, visit);
+        ts.forEachChild(node, (child) => visit(child, subtreeShadowed));
     };
-    visit(sf);
+    visit(sf, new Set());
+}
+
+/**
+ * Collect names from `pool` that this node introduces as a new binding —
+ * function parameters or a catch-clause variable. Used by both collection
+ * and rename passes to skip shadowed subtrees.
+ */
+function collectShadowedNames(node: ts.Node, pool: Set<string>): Set<string> {
+    const hit = new Set<string>();
+    const params = getFunctionLikeParameters(node);
+    if (params) {
+        for (const p of params) addBoundNamesFromPool(p.name, pool, hit);
+        return hit;
+    }
+    if (ts.isCatchClause(node) && node.variableDeclaration) {
+        addBoundNamesFromPool(node.variableDeclaration.name, pool, hit);
+    }
+    return hit;
+}
+
+function addBoundNamesFromPool(binding: ts.BindingName, pool: Set<string>, out: Set<string>): void {
+    if (ts.isIdentifier(binding)) {
+        if (pool.has(binding.text)) out.add(binding.text);
+        return;
+    }
+    if (ts.isObjectBindingPattern(binding) || ts.isArrayBindingPattern(binding)) {
+        for (const el of binding.elements) {
+            if (ts.isBindingElement(el)) addBoundNamesFromPool(el.name, pool, out);
+        }
+    }
 }
 
 /**
@@ -318,50 +391,55 @@ function collectMemberAccessesStrict(
     };
     const flagWildcard = (ln: string) => wildcard.add(ln);
 
-    const visit = (node: ts.Node) => {
-        if (ts.isIdentifier(node) && names.has(node.text)) {
+    // Track function-parameter / catch shadows so an inner `useStore((s) =>
+    // s.X)` doesn't get classified as either a CSS-class use (remaining-side
+    // uses are what tell us "leave this class behind") OR a wildcard escape.
+    const visit = (node: ts.Node, shadowedSet: Set<string>): void => {
+        const nodeShadows = collectShadowedNames(node, names);
+        const subtreeShadowed =
+            nodeShadows.size > 0 ? new Set([...shadowedSet, ...nodeShadows]) : shadowedSet;
+
+        if (ts.isIdentifier(node) && names.has(node.text) && !shadowedSet.has(node.text)) {
             // Look at the parent to classify the usage.
             const parent = node.parent;
-            if (!parent) {
-                ts.forEachChild(node, visit);
-                return;
-            }
-            // Allowed: `s.X` (PropertyAccessExpression where `s` is the expression).
-            if (ts.isPropertyAccessExpression(parent) && parent.expression === node) {
-                recordLiteral(node.text, parent.name.text);
-            }
-            // Allowed: `s['X']` (ElementAccessExpression with literal).
-            else if (
-                ts.isElementAccessExpression(parent) &&
-                parent.expression === node &&
-                ts.isStringLiteral(parent.argumentExpression)
-            ) {
-                recordLiteral(node.text, parent.argumentExpression.text);
-            }
-            // Not allowed: `s[expr]` with non-literal, spread `{...s}`, destructure
-            // `const {x} = s`, rebind `const t = s`, function call `f(s)`,
-            // type-only or import position, etc. — flag wildcard.
-            else if (
-                ts.isElementAccessExpression(parent) &&
-                parent.expression === node
-                // arg is non-literal → wildcard
-            ) {
-                flagWildcard(node.text);
-            } else if (
-                // Skip the identifier appearing in its own declaration site
-                // (`import s from "..."`, `import { s }`, etc.).
-                ts.isImportClause(parent) ||
-                ts.isImportSpecifier(parent) ||
-                ts.isNamespaceImport(parent)
-            ) {
-                // ignore — this is the binding site, not a use
-            } else {
-                flagWildcard(node.text);
+            if (parent) {
+                // Allowed: `s.X` (PropertyAccessExpression where `s` is the expression).
+                if (ts.isPropertyAccessExpression(parent) && parent.expression === node) {
+                    recordLiteral(node.text, parent.name.text);
+                }
+                // Allowed: `s['X']` (ElementAccessExpression with literal).
+                else if (
+                    ts.isElementAccessExpression(parent) &&
+                    parent.expression === node &&
+                    ts.isStringLiteral(parent.argumentExpression)
+                ) {
+                    recordLiteral(node.text, parent.argumentExpression.text);
+                }
+                // Not allowed: `s[expr]` with non-literal, spread `{...s}`, destructure
+                // `const {x} = s`, rebind `const t = s`, function call `f(s)`,
+                // type-only or import position, etc. — flag wildcard.
+                else if (
+                    ts.isElementAccessExpression(parent) &&
+                    parent.expression === node
+                    // arg is non-literal → wildcard
+                ) {
+                    flagWildcard(node.text);
+                } else if (
+                    // Skip the identifier appearing in its own declaration site
+                    // (`import s from "..."`, `import { s }`, etc.).
+                    ts.isImportClause(parent) ||
+                    ts.isImportSpecifier(parent) ||
+                    ts.isNamespaceImport(parent)
+                ) {
+                    // ignore — this is the binding site, not a use
+                } else {
+                    flagWildcard(node.text);
+                }
             }
         }
-        ts.forEachChild(node, visit);
+        ts.forEachChild(node, (child) => visit(child, subtreeShadowed));
     };
-    visit(sf);
+    visit(sf, new Set());
 }
 
 const UNSAFE_AT_RULES = new Set([
@@ -369,38 +447,51 @@ const UNSAFE_AT_RULES = new Set([
     'mixin', 'function', 'import', 'use', 'forward', 'debug', 'warn', 'error',
 ]);
 
-/** Returns 'safe' OR a reason string. */
-function isClassSafeToMove(root: Root, cls: string, usedInRemaining: boolean): string {
+type ClassVerdict = 'safe' | {code: LeftBehindCode; detail?: string; reason: string};
+
+/** Map each verdict code to its long-form description. Single source of truth. */
+const VERDICT_REASONS: Record<LeftBehindCode, string> = {
+    USED: 'still used by code remaining in source file',
+    'NO-RULE': 'no rule found for this class',
+    COMPOUND: 'class appears in a compound selector elsewhere',
+    NESTED: 'has nested rules',
+    'NEST-PARENT': 'rule is nested inside another selector',
+    'AT-RULE': 'uses unsafe @-rule (mixin / function / import / etc)',
+    'SASS-VAR': 'references a Sass variable',
+    EXTEND: '@extend referenced from another rule',
+    'ALIAS-IMP': 'aliased import — resolve manually',
+};
+
+/** Returns 'safe' OR a structured verdict (code + detail + reason). */
+function classSafetyVerdict(root: Root, cls: string, usedInRemaining: boolean): ClassVerdict {
     if (usedInRemaining) {
-        return 'still used by code remaining in source file';
+        return {code: 'USED', reason: VERDICT_REASONS.USED};
     }
     const owning: Rule[] = [];
     let referencedElsewhere = false;
-    let unsafeReason: string | null = null;
+    let unsafe: ClassVerdict | null = null;
 
     root.walkRules((rule) => {
         const sel = rule.selector;
         if (selectorIsOwnedBy(sel, cls)) {
-            // Must be at the root, not nested inside another rule.
             if (rule.parent && rule.parent.type !== 'root') {
-                unsafeReason = `rule is nested inside another selector`;
+                unsafe = {code: 'NEST-PARENT', reason: VERDICT_REASONS['NEST-PARENT']};
                 return;
             }
-            // Inspect body for unsafe at-rules / vars.
             for (const child of rule.nodes ?? []) {
                 if (child.type === 'atrule' && UNSAFE_AT_RULES.has((child as AtRule).name)) {
-                    unsafeReason = `uses @${(child as AtRule).name}`;
+                    const name = (child as AtRule).name;
+                    unsafe = {code: 'AT-RULE', detail: '@' + name, reason: `uses @${name}`};
                     return;
                 }
                 if (child.type === 'rule') {
-                    unsafeReason = `has nested rules`;
+                    unsafe = {code: 'NESTED', reason: VERDICT_REASONS.NESTED};
                     return;
                 }
             }
-            // Sass-variable refs in declarations are flagged conservatively.
             rule.walkDecls((decl) => {
                 if (/\$[A-Za-z_]/.test(decl.value)) {
-                    unsafeReason = `references a Sass variable`;
+                    unsafe = {code: 'SASS-VAR', reason: VERDICT_REASONS['SASS-VAR']};
                 }
             });
             owning.push(rule);
@@ -409,17 +500,15 @@ function isClassSafeToMove(root: Root, cls: string, usedInRemaining: boolean): s
         }
     });
 
-    if (unsafeReason !== null) return unsafeReason;
-    if (owning.length === 0) return 'no rule found for this class';
-    if (referencedElsewhere) return 'class appears in a compound selector elsewhere';
+    if (unsafe !== null) return unsafe;
+    if (owning.length === 0) return {code: 'NO-RULE', reason: VERDICT_REASONS['NO-RULE']};
+    if (referencedElsewhere) return {code: 'COMPOUND', reason: VERDICT_REASONS.COMPOUND};
 
-    // Look for @extend on this class anywhere.
     let extendsThis = false;
     root.walkAtRules('extend', (atrule) => {
-        const param = atrule.params.trim();
-        if (param === '.' + cls) extendsThis = true;
+        if (atrule.params.trim() === '.' + cls) extendsThis = true;
     });
-    if (extendsThis) return '@extend %X / .X referenced from another rule';
+    if (extendsThis) return {code: 'EXTEND', reason: VERDICT_REASONS.EXTEND};
 
     return 'safe';
 }
@@ -517,38 +606,99 @@ function updateExtractedImportsAndRefs(
     const legacyLine = `\nimport ${legacyLocalName} from ${JSON.stringify(legacySpec)};`;
     next = next.slice(0, importEndShifted) + legacyLine + next.slice(importEndShifted);
 
-    // 3. Rewrite `<localName>.<X>` → `<legacyLocalName>.<X>` for left-behind classes.
-    //    Walk the updated AST so we don't accidentally touch strings/comments.
+    // 3. Rewrite `<localName>.<X>` → `<legacyLocalName>.<X>` for left-behind
+    //    classes. Walk the updated AST scope-aware: when entering a function
+    //    whose parameters shadow `imp.localName` (e.g. zustand-style
+    //    `useStore((s) => s.field)` — `s` is the lambda parameter, not the
+    //    CSS-module import), DON'T rewrite inside its body. Pre-scope-aware,
+    //    the rename was a textual `s.X → sLegacy.X` everywhere, which
+    //    silently broke store callbacks.
     const sf = ts.createSourceFile('tmp.tsx', next, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
     const edits: Array<{start: number; end: number; text: string}> = [];
-    const visit = (node: ts.Node) => {
-        if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
-            if (node.expression.text === imp.localName && leftBehindClasses.has(node.name.text)) {
-                edits.push({
-                    start: node.expression.getStart(sf),
-                    end: node.expression.getEnd(),
-                    text: legacyLocalName,
-                });
-            }
-        } else if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression)) {
-            if (
-                node.expression.text === imp.localName &&
-                node.argumentExpression &&
-                ts.isStringLiteral(node.argumentExpression) &&
-                leftBehindClasses.has(node.argumentExpression.text)
-            ) {
-                edits.push({
-                    start: node.expression.getStart(sf),
-                    end: node.expression.getEnd(),
-                    text: legacyLocalName,
-                });
+
+    const visit = (node: ts.Node, shadowed: boolean): void => {
+        const scopeShadowed = shadowed || introducesShadowOf(node, imp.localName);
+        if (!scopeShadowed) {
+            if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
+                if (node.expression.text === imp.localName && leftBehindClasses.has(node.name.text)) {
+                    edits.push({
+                        start: node.expression.getStart(sf),
+                        end: node.expression.getEnd(),
+                        text: legacyLocalName,
+                    });
+                }
+            } else if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression)) {
+                if (
+                    node.expression.text === imp.localName &&
+                    node.argumentExpression &&
+                    ts.isStringLiteral(node.argumentExpression) &&
+                    leftBehindClasses.has(node.argumentExpression.text)
+                ) {
+                    edits.push({
+                        start: node.expression.getStart(sf),
+                        end: node.expression.getEnd(),
+                        text: legacyLocalName,
+                    });
+                }
             }
         }
-        ts.forEachChild(node, visit);
+        ts.forEachChild(node, (child) => visit(child, scopeShadowed));
     };
-    visit(sf);
+    visit(sf, false);
 
     return applyEdits(next, edits);
+}
+
+/**
+ * True when `node` is a function-like (arrow / function / method / catch) AND
+ * one of its parameter bindings shadows `name`. Children of such a node are
+ * walked with `shadowed=true`, suppressing the CSS-rename rewrite inside.
+ *
+ * Skipped intentionally: `const s = …` inside a block. The TypeScript
+ * checker would flag re-declaring an imported identifier as a hard error
+ * (`Cannot redeclare block-scoped variable 's'`), so the case can't occur
+ * in code that compiles. Function parameters DO legitimately shadow, which
+ * is the common bug here.
+ */
+function introducesShadowOf(node: ts.Node, name: string): boolean {
+    const params = getFunctionLikeParameters(node);
+    if (params) {
+        for (const p of params) {
+            if (bindingMatches(p.name, name)) return true;
+        }
+        return false;
+    }
+    if (ts.isCatchClause(node) && node.variableDeclaration) {
+        return bindingMatches(node.variableDeclaration.name, name);
+    }
+    return false;
+}
+
+function getFunctionLikeParameters(node: ts.Node): readonly ts.ParameterDeclaration[] | null {
+    if (
+        ts.isArrowFunction(node) ||
+        ts.isFunctionExpression(node) ||
+        ts.isFunctionDeclaration(node) ||
+        ts.isMethodDeclaration(node) ||
+        ts.isConstructorDeclaration(node) ||
+        ts.isGetAccessorDeclaration(node) ||
+        ts.isSetAccessorDeclaration(node)
+    ) {
+        return node.parameters;
+    }
+    return null;
+}
+
+/** True when an identifier / destructure pattern binds `name`. */
+function bindingMatches(binding: ts.BindingName, name: string): boolean {
+    if (ts.isIdentifier(binding)) return binding.text === name;
+    if (ts.isObjectBindingPattern(binding) || ts.isArrayBindingPattern(binding)) {
+        for (const el of binding.elements) {
+            // Array bindings can contain `OmittedExpression` placeholders.
+            if (ts.isBindingElement(el) && bindingMatches(el.name, name)) return true;
+        }
+    }
+    return false;
 }
 
 function escapeRe(s: string): string {

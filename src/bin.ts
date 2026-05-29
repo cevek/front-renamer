@@ -32,9 +32,10 @@ import {buildPlan} from './plan.js';
 import {Engine} from './engine.js';
 import {runTypecheck} from './typecheck.js';
 import {resolveExtraPaths, rewriteExtraPaths} from './extra-paths.js';
-import {initProjectTypescript} from './ts-loader.js';
+import {initProjectTypescript, ts} from './ts-loader.js';
 import {loadProjectPrettier} from './prettier-loader.js';
 import {buildRunReport, writeRunReport, type RunReport} from './report.js';
+import {findTopLevelDeclaration} from './ts-decl.js';
 
 interface CliArgs {
     opsFile: string;
@@ -200,6 +201,7 @@ async function main() {
         prettier: {available: false, reason: 'not run'},
         rollback: {armed: false, sha: null},
         diffPath: null,
+        coercions: [],
     };
 
     // Resolve the project's TypeScript BEFORE anything else — every downstream
@@ -294,6 +296,20 @@ async function main() {
     }
     console.log(`✓ ${normalized.length} op(s) validated`);
 
+    // Auto-coerce extract destinations from `.ts` to `.tsx` when the symbol's
+    // body contains JSX. ops.json easily mistypes this — a `helpers.ts`
+    // target that turns out to hold a render-helper. Without coercion the
+    // file ends up un-parseable, prettier fails, post-typecheck fails. Better
+    // to fix it for the user and surface what we did.
+    const coercions = coerceJsxDestinations(normalized);
+    if (coercions.length > 0) {
+        console.log(`↻ auto-coerced ${coercions.length} op(s) .ts → .tsx (body contains JSX)`);
+        for (const c of coercions) {
+            console.log(`    op#${c.index}  ${c.symbol}  ${stripSrc(c.oldTo)} → ${path.basename(c.newTo)}`);
+        }
+    }
+    reportState.coercions = coercions;
+
     // -------- Stage 2: pre-typecheck --------
     if (!args.skipTypecheck) {
         const pre = runTypecheck(project.tsconfigPath);
@@ -324,6 +340,13 @@ async function main() {
     try {
         engine.applyToVFS(plan.levels);
         console.log(`✓ applied ${engine.appliedOps.length}/${normalized.length} op(s) in-memory`);
+        // Surface how many extracts the stock LS refused but the patched LS
+        // (@cevek/typescript-extract-refactor-fix) rescued. Zero on a fresh
+        // run means either the patched LS isn't installed OR nothing in this
+        // batch trips the assertion the patch addresses.
+        if (engine.rescuedByFallback > 0) {
+            console.log(`  ↻ ${engine.rescuedByFallback} rescued via patched TS LS`);
+        }
 
         // Catch consumer files (typically those created by earlier extracts in
         // this batch) whose imports the TS LS couldn't reach.
@@ -356,15 +379,24 @@ async function main() {
             console.log(`✓ prettier ${prettier.version} (${formatted} file(s) formatted${skipNote}${failNote})`);
             // Surface formatting failures inline — one bad `.prettierrc`
             // override per file shouldn't kill the batch, but the user needs
-            // to see WHICH files weren't formatted and WHY (so they can fix
-            // the config or accept the unformatted state).
+            // to see WHICH files weren't formatted and WHY. Prettier's error
+            // includes a multi-line source snippet (`> 10 | <jsx>` + caret);
+            // we keep only the first line so the report stays scannable. The
+            // full message is in the JSON report under `prettier.failed[]`.
             for (const f of failed) {
-                console.log(`    ⚠ ${stripSrc(path.relative(root, f.path))}: ${f.reason}`);
+                const firstLine = f.reason.split('\n', 1)[0];
+                console.log(`    ⚠ ${stripSrc(path.relative(root, f.path))}: ${firstLine}`);
             }
         } else {
             reportState.prettier = {available: false, reason: prettier.reason};
             console.log(`· prettier ${prettier.reason}`);
         }
+
+        // CSS co-extract roll-up lives in the `=== summary ===` block now
+        // (printed by `printDrySummary`) — keeps the stage-log band focused
+        // on stages that "ran", and the summary on outcome counts. The
+        // detailed per-stylesheet breakdown still prints under
+        // `=== CSS co-extract ===` lower in the report.
 
         if (args.mode === 'dry') {
             console.log('· dry-run — not writing to disk');
@@ -531,6 +563,7 @@ interface ReportState {
     prettier: RunReport['prettier'];
     rollback: RunReport['rollback'];
     diffPath: string | null;
+    coercions: Array<{index: number; symbol: string; from: string; oldTo: string; newTo: string}>;
 }
 
 /**
@@ -559,6 +592,7 @@ function writeReportIfRequested(args: {reportJson?: string}, opts: {
             importsFilesRewritten: opts.state.importsFilesRewritten,
             prettier: opts.state.prettier,
             rollback: opts.state.rollback,
+            coercions: opts.state.coercions,
             docsUrlFor: categoryDocsUrl,
         });
         writeRunReport(args.reportJson, report);
@@ -697,6 +731,88 @@ function readOpsSource(positional: string, root: string): {opsArray: unknown; la
     return {opsArray, label};
 }
 
+/**
+ * Walk every extract op, parse its source, and check whether the symbol's
+ * body contains JSX. If yes AND the destination ends in `.ts`, coerce to
+ * `.tsx` so prettier + TS-parser don't choke later.
+ *
+ * Grouping: if multiple ops in the batch target the same `.ts` file and
+ * ANY of them carries JSX, ALL ops for that target get coerced together —
+ * otherwise the JSX op would land in `helpers.tsx` while the non-JSX op
+ * would still try to merge into the (now-nonexistent) `helpers.ts`.
+ *
+ * Mutates `ops` in place (`to`/`toAbs`) and returns the list of changes for
+ * the report. Safe to call before the engine starts — at this point the
+ * source files are still untouched on disk.
+ */
+function coerceJsxDestinations(
+    ops: import('./schema.js').NormalizedOp[],
+): Array<{index: number; symbol: string; from: string; oldTo: string; newTo: string}> {
+    // Pass 1: figure out which `.ts` destinations carry ANY JSX symbol.
+    // We parse each unique source file at most once via a per-call cache.
+    const sourceCache = new Map<string, ts.SourceFile | null>();
+    const targetsNeedingCoercion = new Set<string>();
+    for (const op of ops) {
+        if (op.kind !== 'extract') continue;
+        if (!/\.ts$/.test(op.toAbs)) continue;
+        const sf = readSourceFile(op.fromAbs, sourceCache);
+        if (!sf) continue;
+        const decl = findTopLevelDeclaration(sf, op.extract);
+        if (!decl) continue;
+        if (declStatementContainsJsx(decl.statement)) {
+            targetsNeedingCoercion.add(op.toAbs);
+        }
+    }
+    if (targetsNeedingCoercion.size === 0) return [];
+
+    // Pass 2: coerce every op whose toAbs matches a flagged target — even
+    // ops without JSX must follow so they keep merging into the same file.
+    const out: Array<{index: number; symbol: string; from: string; oldTo: string; newTo: string}> = [];
+    for (const op of ops) {
+        if (op.kind !== 'extract') continue;
+        if (!targetsNeedingCoercion.has(op.toAbs)) continue;
+        const oldTo = op.to;
+        // Simple suffix swap — guaranteed-correct because the targets-set
+        // only collects entries that matched `/\.ts$/`.
+        op.to = op.to.replace(/\.ts$/, '.tsx');
+        op.toAbs = op.toAbs.replace(/\.ts$/, '.tsx');
+        out.push({index: op.index, symbol: op.extract, from: op.from, oldTo, newTo: op.to});
+    }
+    return out;
+}
+
+function readSourceFile(absPath: string, cache: Map<string, ts.SourceFile | null>): ts.SourceFile | null {
+    if (cache.has(absPath)) return cache.get(absPath) ?? null;
+    let text: string;
+    try {
+        text = fs.readFileSync(absPath, 'utf8');
+    } catch {
+        cache.set(absPath, null);
+        return null;
+    }
+    // Source kind keyed off extension — `.ts` files mustn't be parsed as TSX
+    // (a `<T>x` cast would misparse), `.tsx` must be parsed as TSX.
+    const kind = /\.tsx$/i.test(absPath) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+    const sf = ts.createSourceFile(absPath, text, ts.ScriptTarget.Latest, true, kind);
+    cache.set(absPath, sf);
+    return sf;
+}
+
+/** True iff the subtree under `node` contains any JSX element / fragment. */
+function declStatementContainsJsx(node: ts.Node): boolean {
+    let found = false;
+    const walk = (n: ts.Node): void => {
+        if (found) return;
+        if (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n) || ts.isJsxFragment(n)) {
+            found = true;
+            return;
+        }
+        ts.forEachChild(n, walk);
+    };
+    walk(node);
+    return found;
+}
+
 function isGitRepo(root: string): boolean {
     try {
         execFileSync('git', ['rev-parse', '--git-dir'], {cwd: root, stdio: 'pipe'});
@@ -743,12 +859,21 @@ function printDrySummary(engine: Engine, levels: number, diffPath: string | null
     }
 
     const total = engine.appliedOps.length + engine.opFailures.length;
+    const css = countCssMovedLeftBehind(engine);
     console.log(`\n=== summary ===`);
     console.log(`phases:           ${levels}`);
     console.log(`ops total:        ${total}`);
     console.log(`  ✓ applied:      ${engine.appliedOps.length}  (moves: ${moves.length}, moves+rename: ${movesWithRename.length}, extracts: ${extracts.length})`);
     console.log(`  ✗ failed:       ${engine.opFailures.length}`);
     console.log(`files with edits: ${edits}`);
+    if (css.sheets > 0) {
+        // CSS counts in the same shape as `ops total: ... ✓ applied ... ✗ failed`
+        // so the eye can compare both blocks at a glance. `⚠` marker on the
+        // left-behind line — every entry there needs manual review.
+        console.log(`CSS classes:      ${css.moved + css.leftBehind} across ${css.sheets} stylesheet(s)`);
+        console.log(`  ✓ moved:        ${css.moved}`);
+        console.log(`  ✗ left behind:  ${css.leftBehind}`);
+    }
     if (diffPath) console.log(`diff:             ${diffPath}`);
 
     if (engine.appliedOps.length === 0) return;
@@ -938,33 +1063,73 @@ function printWarningReport(engine: Engine): void {
     }
 }
 
+/** Roll up the per-stylesheet CSS reports into a single stage-log summary. */
+function countCssMovedLeftBehind(engine: Engine): {moved: number; leftBehind: number; sheets: number} {
+    let moved = 0;
+    let leftBehind = 0;
+    for (const r of engine.cssReports) {
+        moved += r.moved.length;
+        leftBehind += r.leftBehind.length;
+    }
+    return {moved, leftBehind, sheets: engine.cssReports.length};
+}
+
 /**
- * CSS report is intentionally NOT silenced by --quiet — the README explicitly
- * tells users to read it. Use a separate flag if absolute silence is needed.
+ * CSS co-extract report. Compact code-per-class format with the legend
+ * printed ONCE at the bottom — for batches that split 10+ stylesheets,
+ * the long-form reasons used to span 60+ lines; codes get it to ~20.
  */
 function printCssReports(engine: Engine): void {
     const reports = engine.cssReports;
     if (reports.length === 0) return;
     console.log('\n=== CSS co-extract ===');
+    const codesUsed = new Set<string>();
     for (const r of reports) {
-        const src = stripSrc(path.relative(engine.project.root, r.sourceStylesheet));
-        const tgt = r.targetStylesheet
-            ? stripSrc(path.relative(engine.project.root, r.targetStylesheet))
-            : '(none)';
-        console.log(`\n  ${src}  →  ${tgt}`);
+        const srcRel = path.relative(engine.project.root, r.sourceStylesheet);
+        const src = stripSrc(srcRel);
+        // Render target relative to the source — usually a sibling, collapses
+        // the line to `…/AppearancePicker.module.scss → IconDropdown.module.scss`.
+        const tgt = r.targetStylesheet ? shortenTo(srcRel, r.targetStylesheet) : '(none)';
+        console.log(`\n  ${src} → ${tgt}`);
         if (r.moved.length === 0 && r.leftBehind.length === 0) {
             console.log('    (0 classes referenced by extracted block)');
             continue;
         }
         if (r.moved.length > 0) {
-            console.log(`    moved (safe): ${r.moved.map((c) => '.' + c).join(', ')}`);
+            console.log(`    moved: ${r.moved.map((c) => '.' + c).join('  ')}`);
         }
         if (r.leftBehind.length > 0) {
-            console.log('    left behind (manual review):');
-            for (const lb of r.leftBehind) {
-                console.log(`      .${lb.class}  — ${lb.reason}`);
-            }
+            const tags = r.leftBehind
+                .map((lb) => {
+                    codesUsed.add(lb.code);
+                    return `.${lb.class} ${lb.code}${lb.detail ? `(${lb.detail})` : ''}`;
+                })
+                .join('  ');
+            console.log(`    left:  ${tags}`);
         }
+    }
+    if (codesUsed.size > 0) printCssLegend(codesUsed);
+}
+
+/** One-line-per-code legend, alphabetised, only for codes actually used. */
+function printCssLegend(codesUsed: Set<string>): void {
+    const allCodes: Array<[string, string]> = [
+        ['USED', 'still used by code remaining in source file'],
+        ['NO-RULE', 'no matching CSS rule found'],
+        ['COMPOUND', 'appears in a compound selector elsewhere'],
+        ['NESTED', 'rule has nested child rules'],
+        ['NEST-PARENT', 'rule is nested inside another selector'],
+        ['AT-RULE', 'uses unsafe @-rule (mixin / function / import / etc)'],
+        ['SASS-VAR', 'references a Sass variable'],
+        ['EXTEND', '@extend referenced from another rule'],
+        ['ALIAS-IMP', 'aliased import — resolve manually'],
+    ];
+    const lines = allCodes.filter(([c]) => codesUsed.has(c));
+    if (lines.length === 0) return;
+    console.log('\n  legend:');
+    const w = Math.max(...lines.map(([c]) => c.length));
+    for (const [code, desc] of lines) {
+        console.log(`    ${code.padEnd(w)}  ${desc}`);
     }
 }
 
