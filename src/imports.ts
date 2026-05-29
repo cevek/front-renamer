@@ -11,15 +11,15 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as ts from 'typescript';
+import {ts} from './ts-loader.js';
 import type {ProjectInfo} from './preflight.js';
 import type {FsNode, VFSTree} from './vfs.js';
+import {applyEdits, emitQuoted} from './text-edits.js';
+import {moduleCandidates, resolveSpecifierBase, toRelativeImportSpec} from './module-resolve.js';
 
-interface ImportEdit {
-    start: number;
-    end: number;
-    replacement: string;
-}
+// Edit shape comes from `./text-edits.ts` — `TextEdit` uses `text` (not
+// `replacement`); keeps the rewrite path coherent with the rest of the tool.
+type ImportEdit = {start: number; end: number; text: string};
 
 export function rewriteImportsInFile(
     fileNode: FsNode,
@@ -64,19 +64,11 @@ export function rewriteImportsInFile(
                         targetExt,
                     );
                     if (newSpec !== spec) {
-                        // Preserve the original quote style — read the first char of
-                        // the existing literal text rather than always emitting double
-                        // quotes via JSON.stringify.
                         const start = moduleSpec.getStart(sf);
-                        const quote = original[start];
-                        const quoted =
-                            quote === "'" || quote === '`'
-                                ? quote + newSpec.replace(new RegExp(quote, 'g'), '\\' + quote) + quote
-                                : JSON.stringify(newSpec);
                         edits.push({
                             start,
                             end: moduleSpec.getEnd(),
-                            replacement: quoted,
+                            text: emitQuoted(original, start, newSpec),
                         });
                     }
                 }
@@ -87,15 +79,10 @@ export function rewriteImportsInFile(
     visit(sf);
 
     if (edits.length === 0) return {changed: false, content: original};
-    edits.sort((a, b) => b.start - a.start);
-    let next = original;
-    for (const e of edits) {
-        next = next.slice(0, e.start) + e.replacement + next.slice(e.end);
-    }
-    return {changed: true, content: next};
+    return {changed: true, content: applyEdits(original, edits)};
 }
 
-function getModuleSpecifier(node: ts.Node): ts.StringLiteral | null {
+export function getModuleSpecifier(node: ts.Node): ts.StringLiteral | null {
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) return node.moduleSpecifier;
     if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier))
         return node.moduleSpecifier;
@@ -110,39 +97,25 @@ function getModuleSpecifier(node: ts.Node): ts.StringLiteral | null {
     return null;
 }
 
-/** Resolve a relative-or-alias specifier to an absolute INITIAL-tree path (no extension assumed). */
-function resolveSpecifierToInitialPath(spec: string, importerDir: string, project: ProjectInfo): string | null {
-    if (spec.startsWith('.')) {
-        return path.resolve(importerDir, spec);
-    }
-    for (const {aliasPrefix, absPrefix} of project.aliasPrefixes) {
-        if (spec === aliasPrefix.slice(0, -1) || spec.startsWith(aliasPrefix)) {
-            return path.resolve(absPrefix, spec.slice(aliasPrefix.length));
-        }
-    }
-    return null;
+/** Thin alias — keeps the old name as a stable API; delegates to the shared helper. */
+export function resolveSpecifierToInitialPath(spec: string, importerDir: string, project: ProjectInfo): string | null {
+    return resolveSpecifierBase(spec, importerDir, project);
 }
 
 /** Find the target node for a resolved import path: try as a file (with various ext), then as a dir. */
-function locateTargetNode(resolvedAbs: string, tree: VFSTree): FsNode | null {
-    // Already with extension?
-    if (/\.(tsx?|jsx?|module\.scss|module\.css|scss|css)$/.test(resolvedAbs)) {
-        const direct = tree.findByInitialPath(resolvedAbs);
-        if (direct) return direct;
-        // For .module.scss not in the project: synthesize a sibling lookup — we can
-        // still rewrite the path even if the scss isn't tracked, by walking the parent dir.
-        return null;
+export function locateTargetNode(resolvedAbs: string, tree: VFSTree): FsNode | null {
+    // CSS-Modules / plain CSS stay as exact-path lookups — they don't participate
+    // in `MODULE_EXTENSIONS` probing.
+    if (/\.(module\.scss|module\.css|scss|css)$/.test(resolvedAbs)) {
+        return tree.findByInitialPath(resolvedAbs);
     }
-    for (const ext of ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.cjs']) {
-        const n = tree.findByInitialPath(resolvedAbs + ext);
+    for (const candidate of moduleCandidates(resolvedAbs)) {
+        const n = tree.findByInitialPath(candidate);
         if (n) return n;
     }
+    // Folder import (no `index.*` matched, but the directory itself is tracked).
     const asDir = tree.findByInitialPath(resolvedAbs);
     if (asDir) return asDir;
-    for (const ext of ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.cjs']) {
-        const idx = tree.findByInitialPath(path.join(resolvedAbs, 'index' + ext));
-        if (idx) return idx;
-    }
     return null;
 }
 
@@ -172,9 +145,7 @@ function emitSpecifier(
             }
         }
     }
-    let rel = path.relative(importerCurrentDir, target).split(path.sep).join('/');
-    if (!rel.startsWith('.')) rel = './' + rel;
-    return rel;
+    return toRelativeImportSpec(importerCurrentDir, target);
 }
 
 // (Unused export retained for backward signature in case other modules import directly.)

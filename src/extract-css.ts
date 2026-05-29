@@ -27,10 +27,12 @@
  * Anything failing any check → unsafe → user fixes manually.
  */
 import * as path from 'node:path';
-import * as ts from 'typescript';
+import {ts} from './ts-loader.js';
 import postcss, {AtRule, Rule, type Root} from 'postcss';
 import postcssScss from 'postcss-scss';
 import type {FsNode, VFSTree} from './vfs.js';
+import {applyEdits} from './text-edits.js';
+import {toRelativeImportSpec} from './module-resolve.js';
 
 export interface CssCoExtractReport {
     sourceStylesheet: string;
@@ -142,7 +144,17 @@ export function coExtractCssModules(opts: CssCoExtractOptions): CssCoExtractRepo
         // (spread, destructure, computed access, rebind), treat EVERY class in
         // the sheet as still-used — conservative but safe.
         const remainingIsWildcard = remainingWildcard.has(currentImp.localName);
-        if (refsInExtracted.size === 0) continue;
+        if (refsInExtracted.size === 0) {
+            // Emit an empty report so the user sees we DID look — silent skip
+            // looks indistinguishable from "tool didn't try".
+            reports.push({
+                sourceStylesheet: sheetPath,
+                targetStylesheet: '',
+                moved: [],
+                leftBehind: [],
+            });
+            continue;
+        }
 
         const moved: string[] = [];
         const leftBehind: Array<{class: string; reason: string}> = [];
@@ -205,8 +217,8 @@ export function coExtractCssModules(opts: CssCoExtractOptions): CssCoExtractRepo
         // Update the extracted file's import(s) and class references.
         if (moved.length > 0) {
             // Both specifiers must be expressed from the file's FINAL directory.
-            const newRel = relativeImportSpec(extractedCurrentDir, newSheetPath);
-            const legacyRel = relativeImportSpec(extractedCurrentDir, sheetPath);
+            const newRel = toRelativeImportSpec(extractedCurrentDir, newSheetPath);
+            const legacyRel = toRelativeImportSpec(extractedCurrentDir, sheetPath);
             const leftBehindClasses = new Set(leftBehind.map((lb) => lb.class));
             const updatedContent = updateExtractedImportsAndRefs(
                 opts.targetNode.readContent(),
@@ -472,11 +484,8 @@ function makeNewStylesheetPath(dir: string, targetTsxName: string): string {
     return path.join(dir, `${base}.module.scss`);
 }
 
-function relativeImportSpec(fromDir: string, absPath: string): string {
-    let rel = path.relative(fromDir, absPath).split(path.sep).join('/');
-    if (!rel.startsWith('.')) rel = './' + rel;
-    return rel;
-}
+// `relativeImportSpec` removed — use `toRelativeImportSpec` (imported above).
+// CSS specifiers always include `.module.scss`/`.module.css`, so no ext-strip.
 
 /**
  * Edit the extracted file:
@@ -539,11 +548,7 @@ function updateExtractedImportsAndRefs(
     };
     visit(sf);
 
-    edits.sort((a, b) => b.start - a.start);
-    for (const e of edits) {
-        next = next.slice(0, e.start) + e.text + next.slice(e.end);
-    }
-    return next;
+    return applyEdits(next, edits);
 }
 
 function escapeRe(s: string): string {

@@ -9,9 +9,13 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as ts from 'typescript';
+import {ts} from './ts-loader.js';
 import type {ProjectInfo} from './preflight.js';
 import {type FsNode, type VFSTree} from './vfs.js';
+import {applyEdits} from './text-edits.js';
+import {findTopLevelDeclaration} from './ts-decl.js';
+import {moduleCandidates, resolveSpecifierBase} from './module-resolve.js';
+import {safeStat} from './fs-util.js';
 
 export class RenameEngine {
     private versions = new Map<string, number>();
@@ -123,11 +127,10 @@ export class RenameEngine {
             const node = this.tree.findByInitialPath(fileName);
             if (!node) continue;
             const content = node.readContent();
-            const sorted = spans.sort((a, b) => b.start - a.start);
-            let next = content;
-            for (const s of sorted) {
-                next = next.slice(0, s.start) + newName + next.slice(s.end);
-            }
+            const next = applyEdits(
+                content,
+                spans.map((s) => ({start: s.start, end: s.end, text: newName})),
+            );
             if (next !== content) {
                 node.setContent(next);
                 this.versions.set(fileName, (this.versions.get(fileName) ?? 0) + 1);
@@ -137,36 +140,9 @@ export class RenameEngine {
         return {touched};
     }
 
-    /** Only top-level declarations — never recurses into nested scopes. */
+    /** Delegates to shared `findTopLevelDeclaration` — returns only the position. */
     private findDeclarationPosition(sf: ts.SourceFile, name: string): number | null {
-        for (const stmt of sf.statements) {
-            if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === name) {
-                return stmt.name.getStart(sf);
-            }
-            if (ts.isClassDeclaration(stmt) && stmt.name?.text === name) {
-                return stmt.name.getStart(sf);
-            }
-            if (ts.isInterfaceDeclaration(stmt) && stmt.name.text === name) {
-                return stmt.name.getStart(sf);
-            }
-            if (ts.isTypeAliasDeclaration(stmt) && stmt.name.text === name) {
-                return stmt.name.getStart(sf);
-            }
-            if (ts.isEnumDeclaration(stmt) && stmt.name.text === name) {
-                return stmt.name.getStart(sf);
-            }
-            if (ts.isModuleDeclaration(stmt) && ts.isIdentifier(stmt.name) && stmt.name.text === name) {
-                return stmt.name.getStart(sf);
-            }
-            if (ts.isVariableStatement(stmt)) {
-                for (const decl of stmt.declarationList.declarations) {
-                    if (ts.isIdentifier(decl.name) && decl.name.text === name) {
-                        return decl.name.getStart(sf);
-                    }
-                }
-            }
-        }
-        return null;
+        return findTopLevelDeclaration(sf, name)?.pos ?? null;
     }
 
     private findMatchingDefaultImportLocals(
@@ -197,32 +173,15 @@ export class RenameEngine {
     }
 
     private resolveSpec(spec: string, importerDir: string): string | null {
-        let base: string | null = null;
-        if (spec.startsWith('.')) base = path.resolve(importerDir, spec);
-        else {
-            for (const {aliasPrefix, absPrefix} of this.project.aliasPrefixes) {
-                if (spec === aliasPrefix.slice(0, -1) || spec.startsWith(aliasPrefix)) {
-                    base = path.resolve(absPrefix, spec.slice(aliasPrefix.length));
-                    break;
-                }
-            }
-        }
+        const base = resolveSpecifierBase(spec, importerDir, this.project);
         if (!base) return null;
-        for (const c of [base, base + '.tsx', base + '.ts', path.join(base, 'index.tsx'), path.join(base, 'index.ts')]) {
+        for (const c of moduleCandidates(base)) {
             try {
                 if (fs.statSync(c).isFile()) return c;
             } catch {
                 /* skip */
             }
         }
-        return null;
-    }
-}
-
-function safeStat(p: string): fs.Stats | null {
-    try {
-        return fs.statSync(p);
-    } catch {
         return null;
     }
 }

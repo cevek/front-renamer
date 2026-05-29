@@ -264,9 +264,36 @@ export class VFSTree {
         if (parent.childByCurrent(name)) {
             throw new Error(`file already exists at: ${path.join(parent.currentPath(), name)}`);
         }
+        const synthPath = path.join(parent.currentPath(), name);
+        // Collision guard for `byInitialPath`. The map is keyed by INITIAL
+        // paths, which are normally unique. But a synthesised file (extract
+        // target the LS picked a name for) borrows its currentPath as the
+        // initial key — and that currentPath might collide with a node that
+        // moved AWAY from the same disk location earlier in this batch:
+        //   op#1: dir/Foo.tsx exists, moves to OtherDir/Foo.tsx
+        //         → tree has node@dir/Foo.tsx (initial), now @OtherDir/Foo.tsx
+        //         (current). byInitialPath['dir/Foo.tsx'] points to it.
+        //   op#2: extract creates a file the LS named dir/Foo.tsx.
+        //         A raw `.set(synthPath, node)` would evict op#1's node from
+        //         the map — subsequent `findByInitialPath('dir/Foo.tsx')`
+        //         would return the synth node, and op#1's importers would
+        //         resolve to the WRONG target during the import-rewrite pass.
+        //
+        // Surface the collision instead of silently overwriting. The caller
+        // (`extract.ts`) is in the best position to pick a different synth
+        // name and retry — we can't decide that here without breaking the
+        // VFS abstraction.
+        const prior = this.byInitialPath.get(synthPath);
+        if (prior) {
+            throw new Error(
+                `addFileAtCurrent: byInitialPath collision at ${synthPath} — ` +
+                    `another node already claims this initial path (likely an earlier ` +
+                    `move-away whose original disk location matches this new file). ` +
+                    `Use a different synth name and retry.`,
+            );
+        }
         const node = new FsNode(name, 'file', parent);
         parent.addChild(node);
-        const synthPath = path.join(parent.currentPath(), name);
         node.captureInitialPath(synthPath);
         node.setContent(content);
         // Register under its synthetic initial path so importers that reference the

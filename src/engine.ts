@@ -20,7 +20,7 @@ import type {ProjectInfo} from './preflight.js';
 import {VFSTree, type FsNode} from './vfs.js';
 import {RenameEngine} from './rename.js';
 import {rewriteImportsInFile} from './imports.js';
-import {ExtractEngine} from './extract.js';
+import {ExtractEngine, ExtractFailure} from './extract.js';
 
 export class Engine {
     readonly tree: VFSTree;
@@ -34,6 +34,29 @@ export class Engine {
     /** Cache: op.index → declaring file node (set during Phase 1 application). */
     private declNodes = new Map<number, FsNode>();
 
+    /** Whether to keep going when a single op fails (default: false = fail-fast). */
+    continueOnError = false;
+
+    /**
+     * Per-op failures captured during applyToVFS when continueOnError is on.
+     * `category` groups duplicates so the CLI can emit one shared header + a
+     * single-line entry per op instead of repeating the same root cause.
+     */
+    readonly opFailures: Array<{
+        index: number;
+        op: unknown;
+        error: string;
+        category: string | null;
+        context: string | null;
+    }> = [];
+
+    /**
+     * Ops that completed successfully. Lets the dry-run summary report what
+     * the batch actually accomplished — split by kind — instead of inferring
+     * from tree state (which conflates extract-created files with file moves).
+     */
+    readonly appliedOps: Array<import('./schema.js').NormalizedOp> = [];
+
     /** Apply every level in order to the tree. No disk writes yet. */
     applyToVFS(levels: PlanLevel[]): void {
         // ---- Tree mutations honour the plan DAG: one pass per level, dispatching
@@ -41,8 +64,28 @@ export class Engine {
         // a move that produces a file the next level's extract reads from). ----
         for (const lvl of levels) {
             for (const op of lvl.ops) {
-                if (op.kind === 'extract') this.applyExtract(op);
-                else this.applyMoveToTree(op);
+                try {
+                    if (op.kind === 'extract') this.applyExtract(op);
+                    else this.applyMoveToTree(op);
+                    this.appliedOps.push(op);
+                } catch (err) {
+                    // Always record the failure with structured metadata so
+                    // the CLI's `printFailureReport` renders it through the
+                    // same grouped path it uses for continue-mode batches.
+                    // In strict mode we ALSO rethrow to abort — but the entry
+                    // is already in `opFailures`, so the catch site can run
+                    // the report instead of dumping a raw Error.message.
+                    const e = err as Error;
+                    const structured = err instanceof ExtractFailure ? err : null;
+                    this.opFailures.push({
+                        index: op.index,
+                        op,
+                        error: e.message ?? String(err),
+                        category: structured?.category ?? null,
+                        context: structured?.context ?? null,
+                    });
+                    if (!this.continueOnError) throw err;
+                }
             }
         }
 
@@ -60,7 +103,21 @@ export class Engine {
                     continue;
                 }
                 for (const sym of op.renameSymbols) {
-                    this.renames.rename(declNode, sym.old, sym.new);
+                    try {
+                        this.renames.rename(declNode, sym.old, sym.new);
+                    } catch (err) {
+                        // Record BEFORE rethrow, same as the main op loop —
+                        // gives the strict-mode catch site a structured entry
+                        // to format instead of a raw Error message.
+                        this.opFailures.push({
+                            index: op.index,
+                            op,
+                            error: `rename ${sym.old}→${sym.new}: ${(err as Error).message}`,
+                            category: null,
+                            context: null,
+                        });
+                        if (!this.continueOnError) throw err;
+                    }
                 }
             }
         }
@@ -81,9 +138,101 @@ export class Engine {
         this.extracts?.cleanupDiskStubs();
     }
 
+    /** Run the post-process sweep over every file that was edited by extract. */
+    postProcessExtractTouched(): void {
+        this.extracts?.postProcessAllTouched();
+    }
+
+    /**
+     * Patch consumer imports that the TS LS couldn't reach — typically files
+     * created by earlier extract ops in this batch (LS only updates consumers
+     * already in its program).
+     */
+    rewriteExtractSymbolConsumers(): void {
+        this.extracts?.rewriteSymbolConsumers();
+    }
+
     /** Reports from CSS co-extraction (for output). */
     get cssReports(): ReadonlyArray<import('./extract-css.js').CssCoExtractReport> {
         return this.extracts?.cssReports ?? [];
+    }
+
+    /**
+     * Run prettier across every file the batch touched (content overrides or
+     * relocations) — keeps the diff small AND consistent with the project's
+     * own style. Returns a count of files formatted; skipped files (ignored or
+     * unsupported extension) don't count.
+     *
+     * Caller decides whether prettier is available; we just take the formatter.
+     */
+    async formatTouchedFiles(
+        formatter: (absolutePath: string, content: string) => Promise<string | null>,
+    ): Promise<{formatted: number; skipped: number; failed: Array<{path: string; reason: string}>}> {
+        let formatted = 0;
+        let skipped = 0;
+        const failed: Array<{path: string; reason: string}> = [];
+        for (const node of this.tree.iterFiles()) {
+            const touched = node.hasContentOverride() || node.currentPath() !== node.initialPath();
+            if (!touched) continue;
+            const abs = node.currentPath();
+            const before = node.readContent();
+            // Per-file try/catch — a single broken `.prettierrc` override (bad
+            // parser, unknown option, syntax error in the file) MUST NOT kill
+            // the batch. We record it and move on. The user still gets the
+            // touched-file written; just not formatted.
+            let after: string | null;
+            try {
+                after = await formatter(abs, before);
+            } catch (err) {
+                failed.push({path: abs, reason: (err as Error).message});
+                continue;
+            }
+            if (after === null) {
+                skipped++;
+                continue;
+            }
+            if (after !== before) node.setContent(after);
+            formatted++;
+        }
+        return {formatted, skipped, failed};
+    }
+
+    /**
+     * Snapshot of every file the batch touched, suitable for VFS-aware
+     * typecheck in dry mode. Each entry carries:
+     *   - `path` — where the file lives AFTER the batch
+     *   - `content` — post-batch source
+     *   - `initialPath` — where it was BEFORE; used by the typecheck host to
+     *     mark the old location as gone so stale-import diagnostics fire.
+     *
+     * We include every file with either a content override or a relocation —
+     * skipping unchanged files keeps the overlay focused (TS reads disk for
+     * the rest, which is faster than rebuilding source-files from strings).
+     */
+    collectTypecheckOverlay(): Array<{path: string; content: string; initialPath?: string}> {
+        const out: Array<{path: string; content: string; initialPath?: string}> = [];
+        for (const node of this.tree.iterFiles()) {
+            const moved = node.currentPath() !== node.initialPath();
+            const edited = node.hasContentOverride();
+            if (!moved && !edited) continue;
+            out.push({
+                path: node.currentPath(),
+                content: node.readContent(),
+                initialPath: moved ? node.initialPath() : undefined,
+            });
+        }
+        return out;
+    }
+
+    /** Deferred warnings (suspicious extracts, CSS co-extract sub-failures, …). */
+    get extractWarnings(): ReadonlyArray<{
+        index: number;
+        symbol: string;
+        from: string;
+        to: string;
+        reason: string;
+    }> {
+        return this.extracts?.warnings ?? [];
     }
 
     /** Tree-side application of a single MOVE op. */
@@ -111,11 +260,23 @@ export class Engine {
             if (!op.isFolder) {
                 this.declNodes.set(op.index, node);
             } else {
-                const first = op.renameSymbols[0];
-                for (const ext of ['.tsx', '.ts', '.module.scss', '.module.css']) {
-                    const child = node.childByCurrent(first.old + ext);
-                    if (child) {
-                        child.rename(first.new + ext);
+                // Folder op with renameSymbols — rename EVERY matching child
+                // pair (`Old.tsx` → `New.tsx` + same for `.ts`/`.module.scss`
+                // /`.module.css`) for EVERY {old, new} entry. Previously we
+                // only honoured `renameSymbols[0]`, so a folder op with
+                // multiple renames left files for symbols 2..N on disk under
+                // old names while their content was already rewritten — broken
+                // imports across the project.
+                //
+                // The FIRST `.tsx`/`.ts` child we rename becomes the decl-node
+                // anchor for the subsequent identifier-rename pass — that
+                // matches the historical behaviour and keeps `declNodes`
+                // consistent (one anchor per op).
+                for (const sym of op.renameSymbols) {
+                    for (const ext of ['.tsx', '.ts', '.module.scss', '.module.css']) {
+                        const child = node.childByCurrent(sym.old + ext);
+                        if (!child) continue;
+                        child.rename(sym.new + ext);
                         if ((ext === '.tsx' || ext === '.ts') && !this.declNodes.has(op.index)) {
                             this.declNodes.set(op.index, child);
                         }
@@ -238,13 +399,18 @@ export class Engine {
             const to = node.currentPath();
             if (from === to) continue;
             fs.mkdirSync(path.dirname(to), {recursive: true});
+            // No `-k` — under `-k`, git silently skips moves it can't perform
+            // (source gitignored, target collision, etc.) and we'd treat the
+            // op as successful, leaving the source on disk. Then the later
+            // `writeFileSync(target, …)` pass would write the post-move
+            // content to the new path → file effectively duplicated. Without
+            // `-k` git errors out, and our fallback to `fs.renameSync` is the
+            // ONLY non-git fallback we accept.
             try {
-                execFileSync('git', ['mv', '-k', from, to], {cwd: root, stdio: 'pipe'});
-                moved.add(node);
+                execFileSync('git', ['mv', from, to], {cwd: root, stdio: 'pipe'});
             } catch (gitErr) {
                 try {
                     fs.renameSync(from, to);
-                    moved.add(node);
                 } catch (fsErr) {
                     process.stderr.write(
                         `  ✗ failed to move ${from} → ${to}: ${(fsErr as Error).message}\n` +
@@ -253,6 +419,16 @@ export class Engine {
                     throw fsErr;
                 }
             }
+            // Belt-and-braces: post-condition check. Catches the rare case
+            // where the move "succeeded" per the tool's exit code but the
+            // source is still there (e.g. case-insensitive FS rename to
+            // same-case-different path, symlink shenanigans).
+            if (fs.existsSync(from) && from !== to) {
+                throw new Error(
+                    `move post-condition failed: source still exists at ${from} after mv to ${to}`,
+                );
+            }
+            moved.add(node);
         }
 
         // Write brand-new files (produced by extract / similar) to disk.

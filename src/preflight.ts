@@ -3,7 +3,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as ts from 'typescript';
+import {ts} from './ts-loader.js';
 import type {
     NormalizedExtractOp,
     NormalizedMoveOp,
@@ -12,7 +12,7 @@ import type {
     RefactorOpExtract,
     RefactorOpInput,
 } from './schema.js';
-import {deriveVars, isTemplate, renderTemplate} from './template.js';
+import {deriveExtractVars, deriveVars, isTemplate, renderTemplate} from './template.js';
 
 function isExtractOp(input: RefactorOpInput): input is RefactorOpExtract {
     return !Array.isArray(input) && 'extract' in input && typeof (input as RefactorOpExtract).extract === 'string';
@@ -237,6 +237,205 @@ function expandGlob(input: RefactorOpInput, root: string): RefactorOpInput[] {
         }
         return [childFrom, childTo];
     });
+}
+
+/**
+ * Render extract-op `to` templates in-place. Two trigger conditions:
+ *   - op has `extract` + `from` but no `to`, AND a CLI default pattern is
+ *     provided → render the default.
+ *   - op's own `to` contains `{…}` → render it directly.
+ *
+ * Returns the list of render errors. Doesn't throw — caller merges with
+ * schema-validation errors so the user sees ALL problems at once instead
+ * of fixing one, re-running, finding the next.
+ */
+export function expandExtractTemplates(
+    opsArray: unknown,
+    extractToPattern: string | undefined,
+): RawValidationError[] {
+    const errors: RawValidationError[] = [];
+    if (!Array.isArray(opsArray)) return errors;
+    opsArray.forEach((raw, index) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+        const obj = raw as Record<string, unknown>;
+        if (typeof obj.extract !== 'string' || typeof obj.from !== 'string') return;
+        const vars = deriveExtractVars(obj.from, obj.extract);
+
+        const toMissing = !('to' in obj) || obj.to === undefined || obj.to === '';
+        if (toMissing && extractToPattern) {
+            try {
+                obj.to = renderTemplate(extractToPattern, vars);
+            } catch (err) {
+                errors.push({
+                    index,
+                    reason: `--extract-to template failed: ${(err as Error).message}`,
+                });
+            }
+            return;
+        }
+        if (typeof obj.to === 'string' && isTemplate(obj.to)) {
+            try {
+                obj.to = renderTemplate(obj.to, vars);
+            } catch (err) {
+                errors.push({
+                    index,
+                    reason: `"to" template failed: ${(err as Error).message}`,
+                });
+            }
+        }
+    });
+    return errors;
+}
+
+/**
+ * Schema-validate raw ops BEFORE normalization — catches typos in field names,
+ * wrong types, missing required fields, and `from` paths that don't exist on
+ * disk. Returns one error per problem with the offending op's index so users
+ * see the full set in one go instead of fixing-rerunning.
+ *
+ * Designed to be the FIRST thing the CLI runs after JSON.parse, so a slip like
+ * `"from1"` doesn't crash deep inside path.resolve with `paths[1] is undefined`.
+ */
+export function validateRawOps(ops: unknown, root: string): RawValidationError[] {
+    const errors: RawValidationError[] = [];
+
+    if (!Array.isArray(ops)) {
+        errors.push({index: -1, reason: 'ops must be an array (or {ops: [...]})'});
+        return errors;
+    }
+
+    ops.forEach((raw, index) => {
+        if (Array.isArray(raw)) {
+            // Short-tuple form: [from, to].
+            if (raw.length !== 2) {
+                errors.push({index, reason: `tuple op must have exactly 2 elements [from, to], got ${raw.length}`});
+                return;
+            }
+            if (typeof raw[0] !== 'string' || typeof raw[1] !== 'string') {
+                errors.push({index, reason: 'tuple op elements must both be strings'});
+                return;
+            }
+            checkFromExists(index, raw[0], root, errors);
+            return;
+        }
+
+        if (raw === null || typeof raw !== 'object') {
+            errors.push({index, reason: `op must be an object or a [from, to] tuple, got ${typeof raw}`});
+            return;
+        }
+
+        const obj = raw as Record<string, unknown>;
+        const isExtract = 'extract' in obj;
+
+        // Required strings.
+        for (const field of isExtract ? ['extract', 'from', 'to'] : ['from', 'to']) {
+            if (!(field in obj)) {
+                errors.push({index, reason: `missing required field "${field}"`});
+            } else if (typeof obj[field] !== 'string' || (obj[field] as string).length === 0) {
+                errors.push({index, reason: `field "${field}" must be a non-empty string, got ${describeType(obj[field])}`});
+            }
+        }
+
+        // Unknown-field detection — fail loud on typos like `from1`. Suggest
+        // the closest legitimate field name when one is plausibly meant.
+        const allowed = isExtract
+            ? new Set(['extract', 'from', 'to', 'css'])
+            : new Set(['from', 'to', 'renameSymbols']);
+        for (const key of Object.keys(obj)) {
+            if (allowed.has(key)) continue;
+            const suggestion = closestKey(key, allowed);
+            const hint = suggestion ? ` — did you mean "${suggestion}"?` : '';
+            errors.push({index, reason: `unknown field "${key}" for ${isExtract ? 'extract' : 'move'} op${hint}`});
+        }
+
+        // Optional fields, when present, must be the right shape.
+        if (isExtract && 'css' in obj) {
+            const css = obj.css;
+            if (css !== undefined && css !== 'none' && css !== 'copy-safe' && css !== 'empty-stub') {
+                errors.push({
+                    index,
+                    reason: `"css" must be one of "none" | "copy-safe" | "empty-stub", got ${JSON.stringify(css)}`,
+                });
+            }
+        }
+        if (!isExtract && 'renameSymbols' in obj) {
+            const rs = obj.renameSymbols;
+            if (!Array.isArray(rs)) {
+                errors.push({index, reason: '"renameSymbols" must be an array'});
+            } else {
+                rs.forEach((entry, i) => {
+                    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+                        errors.push({index, reason: `renameSymbols[${i}] must be an object {old, new}`});
+                        return;
+                    }
+                    const e = entry as Record<string, unknown>;
+                    if (typeof e.old !== 'string' || typeof e.new !== 'string') {
+                        errors.push({index, reason: `renameSymbols[${i}] must be {old: string, new: string}`});
+                    }
+                });
+            }
+        }
+
+        // Existence check on `from` — only when it's a usable string AND not a
+        // glob (globs are resolved later in `expandGlob`).
+        if (typeof obj.from === 'string' && obj.from.length > 0) {
+            const from = obj.from;
+            if (!from.includes('*') && !from.includes('?')) {
+                checkFromExists(index, from, root, errors);
+            }
+        }
+    });
+
+    return errors;
+}
+
+function checkFromExists(index: number, from: string, root: string, errors: RawValidationError[]): void {
+    const abs = path.resolve(root, from);
+    if (fs.existsSync(abs)) return;
+    errors.push({index, reason: `"from" path does not exist: ${from}`});
+}
+
+function describeType(v: unknown): string {
+    if (v === null) return 'null';
+    if (Array.isArray(v)) return 'array';
+    return typeof v;
+}
+
+/**
+ * Levenshtein distance ≤ 2 → suggest the candidate. Cheap and good enough for
+ * single-typo detection (`from1` → `from`, `t0` → `to`, `extact` → `extract`).
+ */
+function closestKey(key: string, candidates: Set<string>): string | null {
+    let best: {key: string; dist: number} | null = null;
+    for (const c of candidates) {
+        const d = levenshtein(key, c);
+        if (d <= 2 && (!best || d < best.dist)) best = {key: c, dist: d};
+    }
+    return best ? best.key : null;
+}
+
+function levenshtein(a: string, b: string): number {
+    if (a === b) return 0;
+    if (a.length === 0) return b.length;
+    if (b.length === 0) return a.length;
+    const prev = new Array<number>(b.length + 1);
+    const curr = new Array<number>(b.length + 1);
+    for (let j = 0; j <= b.length; j++) prev[j] = j;
+    for (let i = 1; i <= a.length; i++) {
+        curr[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+            const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+            curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+        }
+        for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+    }
+    return prev[b.length];
+}
+
+export interface RawValidationError {
+    /** Index in the raw ops array; -1 means the array itself is malformed. */
+    index: number;
+    reason: string;
 }
 
 export function normalizeOps(ops: RefactorOpInput[], root: string): NormalizedOp[] {

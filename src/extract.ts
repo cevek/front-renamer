@@ -18,40 +18,60 @@
  */
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
-import * as ts from 'typescript';
+import {ts} from './ts-loader.js';
 import type {NormalizedExtractOp} from './schema.js';
 import type {ProjectInfo} from './preflight.js';
 import {VFSTree} from './vfs.js';
 import type {RenameEngine} from './rename.js';
 import {coExtractCssModules, type CssCoExtractReport} from './extract-css.js';
+import {postProcessExtractedFile} from './extract-postprocess.js';
+import {getModuleSpecifier, resolveSpecifierToInitialPath} from './imports.js';
+import {applyEdits, applyTsTextChanges, emitQuoted} from './text-edits.js';
+import {findTopLevelDeclaration} from './ts-decl.js';
+import {moduleCandidates, toRelativeImportSpec} from './module-resolve.js';
+import {safeStat} from './fs-util.js';
+import type {FsNode} from './vfs.js';
+
+/**
+ * Structured per-op failure. Carries enough metadata for the CLI to group ops
+ * by `category` and emit one compact line per op (instead of 5+ verbose lines
+ * each that all repeat the same root cause).
+ */
+export type ExtractFailureCategory =
+    | 'ts-ls-internal'
+    | 'ts-ls-no-edits-move-to-file'
+    | 'ts-ls-declined-move-to-new-file';
+
+export class ExtractFailure extends Error {
+    readonly category: ExtractFailureCategory;
+    readonly op: NormalizedExtractOp;
+    readonly context: string;
+    constructor(category: ExtractFailureCategory, op: NormalizedExtractOp, context: string) {
+        super(`[${category}] op#${op.index} ${op.extract}: ${context}`);
+        this.category = category;
+        this.op = op;
+        this.context = context;
+    }
+}
 
 export class ExtractEngine {
     private service: ts.LanguageService;
     private versions = new Map<string, number>();
-    /**
-     * Stub files we wrote to disk just so TypeScript could see the target as a
-     * real module. In dry-run these are cleaned up at the end of the run. In
-     * apply mode commit() overwrites them with the real post-extract content.
-     */
-    readonly diskStubs: string[] = [];
-    /** Directories we created on disk for stubs. Removed on dry cleanup (deepest first). */
-    private createdDirs: string[] = [];
     /** Co-extraction reports, exposed to bin.ts for output. */
     readonly cssReports: CssCoExtractReport[] = [];
-
-    /** Walk up the path creating only the dirs that didn't exist; remember them for cleanup. */
-    private ensureDirWithRollback(dir: string): void {
-        const segments: string[] = [];
-        let cur = dir;
-        while (cur && !fsSync.existsSync(cur) && cur !== path.dirname(cur)) {
-            segments.unshift(cur);
-            cur = path.dirname(cur);
-        }
-        for (const s of segments) {
-            fsSync.mkdirSync(s);
-            this.createdDirs.push(s);
-        }
-    }
+    /**
+     * Symbol-level moves performed by extract ops. Used in `rewriteSymbolConsumers`
+     * to catch consumer files whose imports the TS LS couldn't update — typically
+     * files synthesised by earlier extract ops in the same batch (LS only updates
+     * consumers in its program; new VFS nodes aren't published to the LS).
+     */
+    private extractedSymbols: Array<{symbol: string; fromAbs: string; toAbs: string}> = [];
+    /**
+     * Per-op warnings (e.g. extracting a value that looks like data/schema, CSS
+     * co-extract sub-failures). Collected and printed grouped at the end, not
+     * streamed mid-run.
+     */
+    readonly warnings: Array<{index: number; symbol: string; from: string; to: string; reason: string}> = [];
 
     constructor(
         readonly project: ProjectInfo,
@@ -61,10 +81,21 @@ export class ExtractEngine {
         _renames: RenameEngine,
     ) {
         const sourceFiles = new Set(project.sourceFiles);
+        // VFS-first host: TS LS sees any file/dir living in the tree as if it
+        // existed on disk. Lets us run "Move to file" against synthesised
+        // targets without ever writing a physical stub — the IDE no longer
+        // flashes ghost files mid-run, and dry-mode is truly zero-write.
         const host: ts.LanguageServiceHost = {
             getCompilationSettings: () => project.compilerOptions,
-            // Include any files we wrote stubs for, so TS LS treats them as in-program.
-            getScriptFileNames: () => Array.from(new Set([...sourceFiles, ...this.diskStubs])),
+            getScriptFileNames: () => {
+                // Original tsconfig roots PLUS any new path we synthesised
+                // (extract targets, retargeted files). De-dup on canonical key.
+                const out = new Set<string>(sourceFiles);
+                for (const node of this.tree.iterFiles()) {
+                    out.add(node.currentPath());
+                }
+                return Array.from(out);
+            },
             getScriptVersion: (fileName) => String(this.versions.get(fileName) ?? 0),
             getScriptSnapshot: (fileName) => {
                 const text = this.readByInitialPath(fileName);
@@ -72,35 +103,53 @@ export class ExtractEngine {
             },
             getCurrentDirectory: () => project.root,
             getDefaultLibFileName: ts.getDefaultLibFilePath,
-            fileExists: (p) => safeStat(p)?.isFile() ?? false,
+            fileExists: (p) => {
+                const byInit = this.tree.findByInitialPath(p);
+                if (byInit && byInit.kind === 'file') return true;
+                const byCur = this.tree.findByCurrentPath(p);
+                if (byCur && byCur.kind === 'file') return true;
+                return safeStat(p)?.isFile() ?? false;
+            },
             readFile: (p) => this.readByInitialPath(p) ?? undefined,
-            directoryExists: (p) => safeStat(p)?.isDirectory() ?? false,
+            directoryExists: (p) => {
+                // TS resolves module specifiers by probing parent directories;
+                // it must see the new directories the batch synthesised for
+                // extract targets (e.g. extracted helpers in fresh subdirs).
+                const node = this.tree.findByCurrentPath(p);
+                if (node && node.kind === 'dir') return true;
+                return safeStat(p)?.isDirectory() ?? false;
+            },
             getDirectories: ts.sys.getDirectories,
             realpath: ts.sys.realpath,
         };
         this.service = ts.createLanguageService(host, ts.createDocumentRegistry());
     }
 
-    /** Remove any stubs (and dirs we created for them) written during extract. */
+    /**
+     * Run the post-process pass on every TS/TSX file in the tree. Idempotent.
+     * Catches type-import/`.ts` extension/`node_modules` quirks introduced by
+     * TS LS across multiple extracts that touch shared consumer files.
+     */
+    postProcessAllTouched(): void {
+        for (const node of this.tree.iterFiles()) {
+            if (!node.hasContentOverride()) continue;
+            if (!/\.(tsx?|jsx?)$/.test(node.currentName)) continue;
+            const before = node.readContent();
+            const after = postProcessExtractedFile(before, {
+                fileAbs: node.currentPath(),
+                compilerOptions: this.project.compilerOptions,
+            });
+            if (after !== before) node.setContent(after);
+        }
+    }
+
+    /**
+     * No-op now: the LS host is VFS-aware, so extracts no longer write physical
+     * stubs. Kept on the API so the engine's `finally`-block call still
+     * compiles and old callers don't need to know we eliminated disk writes.
+     */
     cleanupDiskStubs(): void {
-        for (const p of this.diskStubs) {
-            try {
-                fsSync.unlinkSync(p);
-            } catch {
-                /* already gone */
-            }
-        }
-        this.diskStubs.length = 0;
-        // Deepest first so children go before parents.
-        const dirs = [...this.createdDirs].sort((a, b) => b.length - a.length);
-        for (const d of dirs) {
-            try {
-                if (fsSync.readdirSync(d).length === 0) fsSync.rmdirSync(d);
-            } catch {
-                /* not empty / already gone */
-            }
-        }
-        this.createdDirs.length = 0;
+        /* nothing to clean — extracts no longer touch disk */
     }
 
     private readByInitialPath(initialAbs: string): string | null {
@@ -130,15 +179,11 @@ export class ExtractEngine {
         //    it via tree.moveTo() to op.toAbs.
         const targetNode = this.tree.findByInitialPath(op.toAbs) ?? this.tree.findByCurrentPath(op.toAbs);
         const intoExisting = targetNode !== null;
-
-        // For merging into an existing file, ensure a physical stub exists. TS LS
-        // needs to resolve the target as a module symbol when computing imports.
-        if (intoExisting && !fsSync.existsSync(op.toAbs)) {
-            // Track dirs we create so we can roll them back in dry mode.
-            this.ensureDirWithRollback(path.dirname(op.toAbs));
-            fsSync.writeFileSync(op.toAbs, targetNode!.readContent());
-            this.diskStubs.push(op.toAbs);
-        }
+        // No physical stub on disk — the LS host (see constructor) answers
+        // `fileExists`/`directoryExists` from the VFS, so TS LS sees the target
+        // module without us ever writing a file. Bumps the version so any
+        // cached LS state is invalidated for this round.
+        if (intoExisting) this.bumpVersion(op.toAbs);
         const sourceContent = fromNode.readContent();
         // Source might be `.ts` (no JSX) — parsing as TSX can misread `<T>x` casts.
         const sourceKind = /\.tsx$/i.test(op.fromAbs) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
@@ -176,9 +221,7 @@ export class ExtractEngine {
                     {targetFile: op.toAbs},
                 );
                 if (!edits || edits.edits.length === 0) {
-                    throw new Error(
-                        `extract op#${op.index}: TypeScript produced no edits for "Move to file" of "${op.extract}" → ${op.to}. Known TS LS limitation when merging into a target that imports types or aliases — extract this symbol to a distinct file instead, or do it manually.`,
-                    );
+                    throw new ExtractFailure('ts-ls-no-edits-move-to-file', op, '');
                 }
             } else {
                 edits = this.service.getEditsForRefactor(
@@ -190,26 +233,39 @@ export class ExtractEngine {
                     preferences,
                 );
                 if (!edits || edits.edits.length === 0) {
-                    throw new Error(
-                        `extract op#${op.index}: TypeScript declined "Move to a new file" for "${op.extract}" in ${op.from}. Make sure it's a top-level export and the file has multiple top-level statements.`,
-                    );
+                    throw new ExtractFailure('ts-ls-declined-move-to-new-file', op, '');
                 }
             }
         } catch (err) {
             const message = (err as Error).message ?? String(err);
-            if (message.includes('Expected symbol to be a module')) {
-                throw new Error(
-                    `extract op#${op.index}: hit a TypeScript language-service assertion while refactoring "${op.extract}" from ${op.from} → ${op.to}. This is a known TS LS limitation, usually triggered by complex import alias resolution in the source file's dependencies. Workaround: extract this symbol manually for now.`,
-                );
+            if (
+                message.includes('Expected symbol to be a module') ||
+                message.includes('Debug Failure')
+            ) {
+                // Throw a structured failure — the CLI groups by category and
+                // prints a single short line per op (the long verbose form just
+                // burns tokens when 60+ ops share the same root cause).
+                throw new ExtractFailure('ts-ls-internal', op, buildExtractFailureContext(sf, op));
             }
             throw err;
         }
 
-        // Apply edits.
+        // Dedup edits by VFS-node identity BEFORE applying. The LS may emit
+        // two edits for one logical file when the file was previously
+        // synthesised under a different name (e.g. op#N created `Foo.tsx`
+        // and we renamed it to `helpers.ts`, then op#N+1 generates edits
+        // addressed to BOTH paths). Applying both corrupts the content.
+        //
+        // Strategy: when two changes resolve to the same node, prefer the one
+        // whose fileName matches the op's INTENDED target — that's the edit
+        // the LS computed against helpers.ts's actual content, while the alias
+        // one is a stale snapshot that just adds an import.
+        const dedupedChanges = dedupeFileChangesByNode(edits.edits, this.tree, op.toAbs);
+
         let createdInitialPath: string | null = null;
-        for (const fileChange of edits.edits) {
+        for (const fileChange of dedupedChanges) {
             if (fileChange.isNewFile) {
-                const newContent = applyTextChanges('', fileChange.textChanges);
+                const newContent = applyTsTextChanges('', fileChange.textChanges);
                 const dir = path.dirname(fileChange.fileName);
                 const filename = path.basename(fileChange.fileName);
                 const parent = this.tree.ensureDirAtCurrent(dir);
@@ -227,7 +283,7 @@ export class ExtractEngine {
                     throw new Error(`extract op#${op.index}: edits target unknown file ${fileChange.fileName}`);
                 }
                 const before = node.readContent();
-                const after = applyTextChanges(before, fileChange.textChanges);
+                const after = applyTsTextChanges(before, fileChange.textChanges);
                 node.setContent(after);
                 this.bumpVersion(fileChange.fileName);
             }
@@ -249,6 +305,27 @@ export class ExtractEngine {
             }
         }
 
+        // ---- Post-process EVERY file the LS touched: type-only flips,
+        // node_modules paths, and `.ts/.tsx` extension stripping. Apply to the
+        // target AND to source + consumers so all files are normalised. ----
+        const filesTouched = new Set<string>();
+        for (const fileChange of edits.edits) {
+            filesTouched.add(fileChange.fileName);
+        }
+        if (!intoExisting && createdInitialPath) filesTouched.add(op.toAbs);
+        for (const fileAbs of filesTouched) {
+            const node =
+                this.tree.findByInitialPath(fileAbs) ?? this.tree.findByCurrentPath(fileAbs);
+            if (!node) continue;
+            if (!/\.(tsx?|jsx?)$/.test(node.currentName)) continue;
+            const before = node.readContent();
+            const after = postProcessExtractedFile(before, {
+                fileAbs: node.currentPath(),
+                compilerOptions: this.project.compilerOptions,
+            });
+            if (after !== before) node.setContent(after);
+        }
+
         // Co-extract CSS Modules if requested.
         if (op.css === 'copy-safe') {
             const sourceNode = this.tree.findByInitialPath(op.fromAbs);
@@ -265,78 +342,278 @@ export class ExtractEngine {
                     });
                     this.cssReports.push(...reports);
                 } catch (err) {
-                    // Don't let CSS analysis crash the whole extract.
-                    console.warn(`  ⚠ op#${op.index}: CSS co-extract failed: ${(err as Error).message}`);
+                    // Don't let CSS analysis crash the whole extract; surface the
+                    // miss in the deferred warnings report.
+                    this.warnings.push({
+                        index: op.index,
+                        symbol: op.extract,
+                        from: op.from,
+                        to: op.to,
+                        reason: `CSS co-extract failed: ${(err as Error).message}`,
+                    });
                 }
             }
+        }
+
+        // Track the symbol move so the post-pass can fix consumers the LS missed
+        // (e.g. files synthesised by an earlier extract op in this same batch).
+        this.extractedSymbols.push({symbol: op.extract, fromAbs: op.fromAbs, toAbs: op.toAbs});
+    }
+
+    /**
+     * Sweep every VFS file and patch consumer imports where TS LS missed the
+     * symbol move. Triggers when an `import { ..., S, ... } from <fromAbs>`
+     * survives even though S has moved to `<toAbs>` in this batch. Rewrite to
+     * import S from the new target file, preserving any sibling bindings.
+     *
+     * Why this exists: TS LS' "Move to file" only updates consumers it can see
+     * in its program. Files created by earlier extract ops live in the VFS but
+     * aren't published to the LS, so their imports are never patched.
+     */
+    rewriteSymbolConsumers(): void {
+        if (this.extractedSymbols.length === 0) return;
+        // Group moves by source file → symbol → newAbs (last write wins if a
+        // symbol was somehow extracted twice).
+        const movesBySource = new Map<string, Map<string, string>>();
+        for (const m of this.extractedSymbols) {
+            let inner = movesBySource.get(m.fromAbs);
+            if (!inner) {
+                inner = new Map();
+                movesBySource.set(m.fromAbs, inner);
+            }
+            inner.set(m.symbol, m.toAbs);
+        }
+
+        for (const node of this.tree.iterFiles()) {
+            if (!/\.(tsx?|jsx?)$/.test(node.currentName)) continue;
+            const before = node.readContent();
+            const after = rewriteConsumerImportsForSymbolMoves({
+                content: before,
+                fileNode: node,
+                tree: this.tree,
+                project: this.project,
+                movesBySource,
+            });
+            if (after !== before) node.setContent(after);
         }
     }
 
     private findDeclarationPosition(sf: ts.SourceFile, name: string): number | null {
-        let pos: number | null = null;
-        const visit = (node: ts.Node) => {
-            if (pos !== null) return;
-            if (ts.isFunctionDeclaration(node) && node.name?.text === name) {
-                pos = node.name.getStart(sf);
-                return;
-            }
-            if (ts.isClassDeclaration(node) && node.name?.text === name) {
-                pos = node.name.getStart(sf);
-                return;
-            }
-            if (ts.isVariableStatement(node)) {
-                for (const decl of node.declarationList.declarations) {
-                    if (ts.isIdentifier(decl.name) && decl.name.text === name) {
-                        pos = decl.name.getStart(sf);
-                        return;
-                    }
-                }
-            }
-            if (ts.isInterfaceDeclaration(node) && node.name.text === name) {
-                pos = node.name.getStart(sf);
-                return;
-            }
-            if (ts.isTypeAliasDeclaration(node) && node.name.text === name) {
-                pos = node.name.getStart(sf);
-                return;
-            }
-            // Only walk the top level — the "Move to a new file" refactor only
-            // applies to top-level declarations.
-        };
-        sf.forEachChild(visit);
-        return pos;
+        return findTopLevelDeclaration(sf, name)?.pos ?? null;
     }
+}
+
+/**
+ * If the named symbol is a `const X = <expr>` where <expr> is a call (e.g.
+ * `z.object(...)`, `create(...)`) and the identifier is uppercase-first, it's
+ * very likely DATA, not a component/hook. Returns a short human-readable
+ * description, or null if nothing to warn about.
+ */
+/** Collect enough surface info about a failed extract to triage the cause. */
+function buildExtractFailureContext(sf: ts.SourceFile, op: NormalizedExtractOp): string {
+    let aliasImports = 0;
+    let relativeImports = 0;
+    let typeOnlyImports = 0;
+    let topLevelStatements = 0;
+    let topLevelExports = 0;
+    for (const stmt of sf.statements) {
+        topLevelStatements++;
+        if (ts.isImportDeclaration(stmt)) {
+            const spec = ts.isStringLiteral(stmt.moduleSpecifier) ? stmt.moduleSpecifier.text : '';
+            if (spec.startsWith('.')) relativeImports++;
+            else if (spec.length > 0) aliasImports++;
+            if (stmt.importClause?.isTypeOnly) typeOnlyImports++;
+        }
+        const mods = ts.canHaveModifiers(stmt) ? ts.getModifiers(stmt) : undefined;
+        if (mods?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) topLevelExports++;
+    }
+    const parts = [
+        `${topLevelStatements} top-level statements`,
+        `${topLevelExports} exports`,
+        `${aliasImports} alias imports`,
+        `${relativeImports} relative imports`,
+    ];
+    if (typeOnlyImports > 0) parts.push(`${typeOnlyImports} type-only imports`);
+    if (op.from === op.to) parts.push('from === to');
+    return parts.join(', ');
 }
 
 function findDeclarationStatement(sf: ts.SourceFile, name: string): ts.Statement | null {
+    return findTopLevelDeclaration(sf, name)?.statement ?? null;
+}
+
+// `applyTextChanges` / `applyEdits` / quote-preservation all live in
+// `./text-edits.ts` now — see imports at the top.
+
+/**
+ * Patch a single consumer file's imports when symbols it imports have moved
+ * between files due to extract ops. The TS LS already handles consumers in its
+ * program, but files created by earlier extracts in the same batch are invisible
+ * to the LS — we catch those here.
+ *
+ * The strategy: split each import declaration whose specifier resolves to a
+ * known `fromAbs`. Keep non-moved bindings on the original import; emit fresh
+ * import declarations for each destination. New specifiers anchor relative to
+ * the consumer's INITIAL dir; `rewriteAllImports` runs after this and normalises
+ * everything to current locations.
+ */
+/**
+ * Collapse LS file changes that target the SAME VFS node under different
+ * names (LS-chosen path vs. our renamed currentPath). For each node, prefer
+ * the change whose fileName matches the op's intended target (`op.toAbs`) —
+ * that change is the one computed against the live VFS content. The alias
+ * one is a leftover from the LS's stale internal book-keeping and only
+ * patches imports, which produces self-referential nonsense when applied
+ * to the same node.
+ *
+ * New-file changes (`isNewFile`) are never collapsed — they create distinct
+ * tree nodes and have nothing to dedup against.
+ */
+function dedupeFileChangesByNode(
+    changes: readonly ts.FileTextChanges[],
+    tree: VFSTree,
+    intendedTarget: string,
+): ts.FileTextChanges[] {
+    const groupsByNode = new Map<FsNode, ts.FileTextChanges[]>();
+    const out: ts.FileTextChanges[] = [];
+
+    for (const change of changes) {
+        if (change.isNewFile) {
+            out.push(change);
+            continue;
+        }
+        const node =
+            tree.findByInitialPath(change.fileName) ?? tree.findByCurrentPath(change.fileName);
+        if (!node) {
+            // Unknown file — pass through, let the caller raise its own error.
+            out.push(change);
+            continue;
+        }
+        const list = groupsByNode.get(node) ?? [];
+        list.push(change);
+        groupsByNode.set(node, list);
+    }
+
+    for (const list of groupsByNode.values()) {
+        if (list.length === 1) {
+            out.push(list[0]);
+            continue;
+        }
+        // Multiple edits for one node — pick the canonical one.
+        const canonical = list.find((c) => c.fileName === intendedTarget) ?? list[list.length - 1];
+        out.push(canonical);
+    }
+    return out;
+}
+
+function rewriteConsumerImportsForSymbolMoves(args: {
+    content: string;
+    fileNode: FsNode;
+    tree: import('./vfs.js').VFSTree;
+    project: ProjectInfo;
+    movesBySource: Map<string, Map<string, string>>;
+}): string {
+    const {content, fileNode, project, movesBySource} = args;
+    const initialDir = path.dirname(fileNode.initialPath());
+
+    const sf = ts.createSourceFile(
+        fileNode.initialPath(),
+        content,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TSX,
+    );
+
+    const edits: Array<{start: number; end: number; text: string}> = [];
+
     for (const stmt of sf.statements) {
-        if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === name) return stmt;
-        if (ts.isClassDeclaration(stmt) && stmt.name?.text === name) return stmt;
-        if (ts.isInterfaceDeclaration(stmt) && stmt.name.text === name) return stmt;
-        if (ts.isTypeAliasDeclaration(stmt) && stmt.name.text === name) return stmt;
-        if (ts.isVariableStatement(stmt)) {
-            for (const decl of stmt.declarationList.declarations) {
-                if (ts.isIdentifier(decl.name) && decl.name.text === name) return stmt;
+        if (!ts.isImportDeclaration(stmt)) continue;
+        const moduleSpec = getModuleSpecifier(stmt);
+        if (!moduleSpec) continue;
+        const spec = moduleSpec.text;
+        const resolved = resolveSpecifierToInitialPath(spec, initialDir, project);
+        if (!resolved) continue;
+
+        // Match the resolved path against move sources, trying common module
+        // extensions like locateTargetNode does. Whichever extension hits gives us
+        // the bindings map.
+        let movedMap: Map<string, string> | null = null;
+        for (const candidate of moduleCandidates(resolved)) {
+            const hit = movesBySource.get(candidate);
+            if (hit) {
+                movedMap = hit;
+                break;
             }
         }
+        if (!movedMap) continue;
+
+        const clause = stmt.importClause;
+        if (!clause?.namedBindings || !ts.isNamedImports(clause.namedBindings)) continue;
+        const elems = clause.namedBindings.elements;
+        const stay: ts.ImportSpecifier[] = [];
+        // Group moved bindings by destination so we can emit one import per dest.
+        const moveTo = new Map<string, Array<{name: string; alias: string | null; typeOnly: boolean}>>();
+        const clauseTypeOnly = clause.isTypeOnly === true;
+        for (const elem of elems) {
+            const importedName = (elem.propertyName ?? elem.name).text;
+            const localName = elem.name.text;
+            const dest = movedMap.get(importedName);
+            if (!dest) {
+                stay.push(elem);
+                continue;
+            }
+            const list = moveTo.get(dest) ?? [];
+            list.push({
+                name: importedName,
+                alias: importedName === localName ? null : localName,
+                typeOnly: elem.isTypeOnly === true,
+            });
+            moveTo.set(dest, list);
+        }
+        if (moveTo.size === 0) continue;
+
+        // Emit:
+        //  - If anything stays, rewrite the original import with only those bindings.
+        //  - Otherwise, drop the original entirely.
+        //  - Always append one new import per destination.
+        const defaultPart = clause.name ? `${clause.name.text}, ` : '';
+        const newLines: string[] = [];
+        if (stay.length > 0 || clause.name) {
+            const stayTexts = stay.map((e) =>
+                `${e.isTypeOnly ? 'type ' : ''}${e.propertyName ? `${e.propertyName.text} as ${e.name.text}` : e.name.text}`,
+            );
+            const keyword = clauseTypeOnly ? 'import type ' : 'import ';
+            const namedPart = stayTexts.length > 0 ? `{ ${stayTexts.join(', ')} }` : '';
+            const fromPart = emitQuoted(content, moduleSpec.getStart(sf), spec);
+            const composed = stayTexts.length > 0 || clause.name
+                ? `${keyword}${defaultPart}${namedPart} from ${fromPart};`
+                : '';
+            if (composed) newLines.push(composed);
+        }
+        for (const [destAbs, items] of moveTo) {
+            const newSpec = toRelativeImportSpec(initialDir, destAbs, {stripTsExt: true});
+            const allType = clauseTypeOnly || items.every((i) => i.typeOnly);
+            const keyword = allType ? 'import type ' : 'import ';
+            const itemTexts = items.map((i) => {
+                const head = !allType && i.typeOnly ? 'type ' : '';
+                return `${head}${i.alias ? `${i.name} as ${i.alias}` : i.name}`;
+            });
+            const newQuoted = emitQuoted(content, moduleSpec.getStart(sf), newSpec);
+            newLines.push(`${keyword}{ ${itemTexts.join(', ')} } from ${newQuoted};`);
+        }
+
+        edits.push({
+            start: stmt.getStart(sf),
+            end: stmt.getEnd(),
+            text: newLines.join('\n'),
+        });
     }
-    return null;
+
+    return applyEdits(content, edits);
 }
 
-function applyTextChanges(original: string, changes: readonly ts.TextChange[]): string {
-    // Sort right-to-left so positions don't shift as we apply.
-    const sorted = [...changes].sort((a, b) => b.span.start - a.span.start);
-    let next = original;
-    for (const c of sorted) {
-        next = next.slice(0, c.span.start) + c.newText + next.slice(c.span.start + c.span.length);
-    }
-    return next;
-}
+// `resolvedCandidates` removed — use `moduleCandidates` from `./module-resolve.js`.
 
-function safeStat(p: string): fsSync.Stats | null {
-    try {
-        return fsSync.statSync(p);
-    } catch {
-        return null;
-    }
-}
+// `relativeSpec` removed — use `toRelativeImportSpec(fromDir, toAbs, {stripTsExt: true})`.
+
+// `quote` removed — use `emitQuoted` from `./text-edits.ts`.

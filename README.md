@@ -1,103 +1,57 @@
 # front-renamer
 
-**Restructure your React/TypeScript codebase in seconds, not days.**
+**Restructure a React/TypeScript codebase in seconds.**
 
 Declare where every file should live, run one command, ship a clean tree —
-imports rewritten, identifiers renamed, history preserved.
+imports rewritten, identifiers renamed, history preserved, formatter applied.
 
 ```bash
 npx front-renamer ops.json --apply
 ```
 
----
+## What it does
 
-## The problem
+You write JSON describing what should be where. The tool:
 
-Your folder structure stopped scaling six months ago. You know exactly how it
-should look. But getting there means:
+- Moves every file and folder (`git mv` — history survives)
+- Rewrites every `import` across the project, both `@/`-aliased and relative
+- Renames matching identifiers (and their references) via the TypeScript LS
+- Carries sibling `.module.scss` / `.module.css` along
+- Extracts top-level symbols into new files via TS LS "Move to a new file"
+- Co-extracts the CSS classes that block uses (safe-only)
+- Type-checks before AND after; refuses to start if the project already
+  fails, refuses if the git tree is dirty
+- Runs the project's prettier over every touched file
 
-- moving **hundreds of files** across the repo
-- updating **thousands of imports** in lockstep
-- renaming components and their props/hooks/helpers consistently
-- keeping `git log --follow` intact so history doesn't die
-- doing all of it without breaking TypeScript for a single commit in between
+Real-world: **129 ops, 62 applied, post-typecheck clean, ~32 s** end-to-end
+including two full project type-checks and prettier.
 
-That's a one-to-three-day project for a senior engineer. So the structure stays
-broken. New code piles on top of the bad layout. The cost compounds.
-
-IDE rename works one symbol at a time. Find-and-replace ruins your imports.
-`ts-morph` lets you script it — but only after you become a ts-morph expert.
-None of these scale to "rearrange the whole repo this afternoon."
-
-## What front-renamer does
-
-You write a JSON file that says **what should be where**:
-
-```json
-[
-  ["src/components/Dashboard", "src/features/dashboard/DashboardView"],
-  ["src/components/UserSettings", "src/features/users/UserSettings"],
-  ["src/components/Button", "src/components/ui/Button"],
-  ["src/components/Spinner.tsx", "src/components/ui/Loader.tsx"]
-]
-```
-
-Run it:
+## Install / run
 
 ```bash
-npx front-renamer ops.json --apply
-```
+# one-off
+npx front-renamer ops.json
 
-Done. The tool:
-
-- Moves every file and folder to its new home
-- Rewrites every `import` in your entire codebase — both `@/`-aliased and
-  relative — to the new locations
-- Renames the matching component identifier (and its `Props`, and any
-  other declarations you list) across every reference in the project
-- Carries sibling `.module.scss` along for the ride
-- Uses `git mv` so `git log --follow` still works tomorrow
-- Type-checks before AND after, refusing to run if your repo isn't already
-  green, and bailing loudly if something it did breaks the build
-
-Real-world test: **126 ops, 769 file relocations, 424 files with rewritten
-imports — ~15 seconds end-to-end including two full project type-checks.**
-
-## Why declarative
-
-You don't have to learn an API. You don't have to write code. You don't have to
-remember whether `move()` updates aliased imports (it doesn't, and that's where
-the day disappears).
-
-You describe the destination. The tool computes the path.
-
-## Quick start
-
-> **Before you run `--apply`, commit or stash everything in your working tree.**
-> The tool rewrites hundreds of files in one shot. If anything looks off
-> afterwards (post-typecheck failure, missed import, surprise file move), the
-> only painless rollback is `git restore .` + `git clean -fd`. That only works
-> if the pre-run state was clean.
-
-```bash
-# Preview what would change — no disk writes
-npx front-renamer ops.json --dry
-
-# Apply for real
-npx front-renamer ops.json --apply
-```
-
-Install as a dev dependency:
-
-```bash
+# dev dependency
 pnpm add -D front-renamer
 pnpm exec front-renamer ops.json --apply
 ```
 
+```bash
+# preview (dry-run; nothing touches disk)
+front-renamer ops.json
+
+# apply for real
+front-renamer ops.json --apply
+
+# inline JSON instead of a file
+front-renamer '[["src/old", "src/new"]]' --apply
+```
+
 ## Writing ops
 
-Ops are a JSON array. Each entry is either a **short tuple** or a **full
-object**. Mix them freely:
+Each entry is a short tuple, a full move-object, or an extract-object.
+Mix freely.
 
 ```json
 [
@@ -105,238 +59,201 @@ object**. Mix them freely:
 
   {
     "from": "src/components/Inputs",
-    "to": "src/components/forms/fields"
+    "to":   "src/components/forms/fields"
   },
 
   {
     "from": "src/components/Widget",
-    "to": "src/features/widgets/Widget",
+    "to":   "src/features/widgets/Widget",
     "renameSymbols": [
       {"old": "Widget", "new": "WidgetCard"},
-      {"old": "WidgetProps", "new": "WidgetCardProps"},
-      {"old": "useWidget", "new": "useWidgetCard"}
+      {"old": "WidgetProps", "new": "WidgetCardProps"}
     ]
+  },
+
+  {
+    "extract": "Header",
+    "from":    "src/Sales/Sales.tsx",
+    "to":      "src/Sales/Header/Header.tsx",
+    "css":     "copy-safe"
   }
 ]
 ```
 
-### How rename detection works
+**Conventions**
 
-When you write a tuple or a full object **without** `renameSymbols`, the tool
-checks: did the basename change? If yes and the file (or main `<basename>.tsx`
-inside a folder) exists, it renames that identifier and its references for free.
+- Paths are project-relative (or relative to `--cwd`).
+- Extension → file. No extension → folder.
+- Tuple/object without `renameSymbols` → auto-detects ONE rename from
+  the basename diff. Pass `[]` to suppress, pass the explicit list for
+  multiple identifiers.
 
-When you need finer control — multiple identifiers in one file, or a rename
-that the basename can't express — list them explicitly under `renameSymbols`.
-
-Pass `"renameSymbols": []` to suppress autodetection.
-
-### Extracting a symbol into a new file
-
-Lift a top-level component, hook, or type out of a busy file:
+**Globs and templates**
 
 ```json
-{
-  "extract": "Header",
-  "from": "src/Sales/Sales.tsx",
-  "to":   "src/Sales/Header/Header.tsx"
-}
+[["src/components/ds/*", "src/components/"]]
 ```
 
-Multiple extracts into the same target are honoured — first creates the file,
-each subsequent one merges in.
+`*` must be in the final segment. Templates on `to`:
+`"src/features/{stem|strip:Section|kebab}/{stem|strip:Section}View.tsx"`
+with filters `lc`, `uc`, `kebab`, `strip:Suffix`, `stripPrefix:Prefix`.
 
-> **Extract relies entirely on the TypeScript language service.** If TS itself
-> can't perform "Move to a new file" / "Move to file" for a given symbol —
-> common triggers: complex alias imports the LS can't fully resolve, the file
-> has only one top-level statement, or a deep TS LS internal assertion — the
-> tool will refuse the op with a clear message. **In that case, delete the op
-> from your JSON and extract the symbol by hand.** The tool will not invent
-> its own refactor logic; it would silently corrupt the file.
+**Extract templates.** For a folder-per-component layout you don't have to
+spell out `to` per op — pass `--extract-to <pattern>`:
 
-#### Co-extracting CSS Modules
-
-Set `"css": "copy-safe"` on an extract op:
-
-```json
-{
-  "extract": "Header",
-  "from": "src/Sales/Sales.tsx",
-  "to":   "src/Sales/Header/Header.tsx",
-  "css":  "copy-safe"
-}
+```bash
+front-renamer ops.json --extract-to "{dir}/{symbol}/{symbol}.tsx" --apply
 ```
 
-The tool walks the source file's sibling `.module.scss`/`.module.css`, figures
-out which classes the extracted block uses, and moves the **provably safe** ones
-into a fresh stylesheet next to the extracted file. Anything that doesn't pass
-the safety bar stays in the original sheet; references to those classes get
-rewritten to `sLegacy.X` (with an auto-injected legacy import) so the extracted
-file still compiles. The tool prints a per-class report:
+Extra vars in this context: `{symbol}` (the extract name) and `{dir}`
+(project-relative directory of `from`). An op's own `to` can also be a
+template literal — same vars, applied per-op.
 
-```
---- CSS co-extract ---
-  src/Sales/Sales.module.scss  →  src/Sales/Header/Header.module.scss
-    moved (safe): .title, .icon
-    left behind (manual review):
-      .body   — class appears in a compound selector elsewhere
-      .label  — uses @include mixin
-```
+**Extract caveats.** Extract delegates to the TS language service.
+If TS can't perform "Move to a new file" / "Move to file" for a symbol
+(LS internal assertion, no edits produced, etc.) the op fails cleanly
+with a grouped report — extract that symbol manually. The tool never
+invents its own extract logic.
 
-> **Safe co-extract is conservative but not magic.** Stylesheets vary wildly —
-> `@use`/`@import` chains, parent selectors, `@extend %placeholder`, deeply
-> nested media queries, value interpolation through Sass functions, mixin
-> arguments referencing the outer scope. The tool refuses to move anything it
-> can't reason about cleanly, but a handful of micro-cases (CSS-in-JS shapes
-> we don't recognise, comment-attachment quirks across postcss versions,
-> specifier resolution through tsconfig paths in non-relative imports) can
-> still produce a stylesheet that **looks** right but breaks at runtime.
-> **Always diff the output, eyeball the moved/left-behind report, and run your
-> visual regression tests before merging.** A handful of leftover unsafe
-> classes is the expected outcome — that's the design.
-
-### Path conventions
-
-- Paths are relative to the project root (or `--cwd <path>`).
-- Extension on the path means **file**. No extension means **folder**.
+**CSS co-extract (`"css": "copy-safe"`).** The tool walks the source's
+sibling stylesheet, figures out which classes the extracted block uses,
+moves the **provably safe** ones into a fresh stylesheet next to the
+extracted file. Anything ambiguous (compound selectors, `@include`,
+`@extend`, value interpolation) stays in the original — references get
+rewritten to `sLegacy.X`. A per-class moved/left-behind report prints
+at the end. **Diff and visual-test before merging.**
 
 ## CLI
 
 ```
-front-renamer <ops.json> [options]
+front-renamer <ops.json | inline-json> [options]
 
   --apply              Commit changes to disk (default is dry-run).
   --dry                Force dry-run (default).
-  --cwd <path>         Project root. Default: current working directory.
-  --tsconfig <path>    tsconfig file. Default: autodetect tsconfig.app.json
-                       → tsconfig.json.
-  --src <path>         Source directory to scan. Default: <cwd>/src.
+  --cwd <path>         Project root. Default: cwd.
+  --tsconfig <path>    Autodetect tsconfig.app.json → tsconfig.json.
+  --src <path>         Source directory. Default: <cwd>/src.
   --skip-typecheck     Skip pre-/post-typecheck (faster, less safe).
   --no-rollback        Disable auto-rollback on post-typecheck failure.
-                       (Default: rollback ON when the working tree was clean.)
-  --no-prune           Don't remove empty directories left behind by moves.
-  --quiet              Reduce output to errors and final status.
-  -h, --help           Show this help.
+  --no-prune           Don't remove empty dirs after moves.
+  --strict             Hard-fail on first op error (default: continue
+                       and collect failures into a final report).
+  --extract-to <pat>   Template applied to extract ops that omit "to"
+                       (e.g. "{dir}/{symbol}/{symbol}.tsx").
+  --report-json <path> Machine-readable run report (see below).
+  --rewrite-paths-in   Also substitute path refs in non-TS files (HTML,
+                       config, JSON, Markdown). Repeatable.
+  -h, --help
 ```
 
-## What it handles
+## How it stays safe
 
-- **Folder moves** with arbitrary depth — children, grandchildren, sibling
-  styles, everything follows.
-- **Folder renames** in place (`PatientRecord` → `PatientRecordView`).
-- **File moves** — wrap a loose file into its own folder, drop it into a
-  shared `helpers/` dir, anything.
-- **Identifier renames** across the entire project via the TypeScript
-  language service. Default-import local bindings get rebound too.
-- **Sibling assets** — `.module.scss` / `.module.css` next to a `.tsx`
-  travel with it automatically.
-- **Aliased imports** (`@/components/Foo`) — resolved via `tsconfig.paths`
-  and rewritten alongside relative imports.
-- **Chains** — `A → B`, then later `B → C` somewhere else in the same ops
-  file. The tool builds a dependency graph and applies in the right order.
-- **Swap-via-temp** — pass two folders through a temporary name to exchange
-  them: `A → __tmp`, `B → A`, `__tmp → B`. Planner figures out the order.
-- **Glob sources** — `["src/components/ds/*", "src/components/"]` expands to
-  one op per matched child. `*` must be in the final path segment.
-- **Templated destinations** — variables `{name}`, `{stem}`, `{ext}`,
-  `{parent}` plus filters `lc`, `uc`, `kebab`, `strip:Suffix`,
-  `stripPrefix:Prefix`. Example pattern:
-  `"src/features/{stem|strip:Section|kebab}/{stem|strip:Section}View.tsx"`.
-- **Path rewrites in non-TS files** — pass `--rewrite-paths-in <glob>` for
-  files like `index.html` or `vite.config.ts` to substitute path references
-  to anything you've moved.
-- **Empty directory cleanup** — recursive prune after commit; `--no-prune`
-  to keep them.
-- **Auto-rollback** — when the working tree is clean at start, a failed
-  post-typecheck is reverted via `git reset --hard && git clean -fd`.
-- **Random input order** — your ops don't need to be sorted. The planner
-  topologically sorts them and reports parallel-safe phases.
+- **Refuses dirty git tree in `--apply`.** Commit or stash first — your
+  uncommitted work would be entangled with the tool's edits and rollback
+  would wipe it.
+- **Pre-typecheck** — bails if the project already has TS errors so
+  post-typecheck failures are clearly attributable to the refactor.
+- **Post-typecheck** runs against the **in-memory** post-batch state in
+  dry-run (no commit needed to know if the result compiles).
+- **Auto-rollback** on post-typecheck failure in apply: `git reset --hard
+  <snapshot> && git clean -fd`. Armed only when the tree was clean at
+  start.
+- **Dry-run is zero-write.** The TS language service runs against a
+  VFS-aware host — no `.module.scss.tmp` flickers in your IDE.
+- **Schema validation runs first.** A typo like `from1` fails in
+  milliseconds with `did you mean "from"?` instead of an opaque crash
+  fifteen seconds into a type-check.
 
-## What it doesn't do
+## Output
 
-This is a structural tool, not a codemod. It deliberately stays out of code
-semantics.
+```
+front-renamer (dry-run)
+  root      /path/to/project
+  ops       ops.json
+  tsconfig  tsconfig.json
+  ts        6.0.3 (project)         ← resolved from project's node_modules
 
-- **It doesn't decide the structure for you.** You declare the destination.
-  The tool applies it.
-- **It doesn't transform code.** No "convert all class components to hooks",
-  no "swap library A for library B". If you want jscodeshift-style rewrites,
-  run them separately.
-- **It doesn't split or merge files.** Files move as units. Extracting one
-  export into a new file, or combining two files into one — out of scope.
-- **It doesn't touch strings, comments, or JSX text.** `"OldName"` written as
-  a string literal stays a string literal. Same for log messages, docs,
-  comments mentioning old names.
-- **It doesn't run formatters.** Run Prettier, ESLint, oxlint, etc.
-  separately after `--apply` if your team cares about quote style or
-  whitespace conventions.
-- **It doesn't update external config files.** `knip.json`, ESLint configs,
-  Vite aliases, `package.json` scripts that hardcode old paths — those are
-  yours to update. Only `tsconfig.paths` is read (to resolve `@/`-style
-  aliases).
-- **It doesn't commit to git.** It uses `git mv` for relocations so history
-  is preserved, but writing the commit (and its message) is your job.
-- **It doesn't resolve dynamic imports.** `import(someVariable)` and
-  `require(someExpr)` are invisible — only string-literal specifiers get
-  rewritten.
-- **It doesn't work without TypeScript.** A `tsconfig.json` (or
-  `tsconfig.app.json`) is required. JS-only repos aren't supported.
-- **It doesn't rename non-exported locals.** Identifier renames target
-  declarations referenced across files. A function-local variable named the
-  same as your component stays untouched (which is what you want).
-- **It doesn't auto-attach non-TS assets by import graph.** Sibling
-  `.module.scss` / `.module.css` next to a moved `.tsx` follow automatically.
-  Anything else (regular `.css`, images, JSON fixtures, MDX) needs an
-  **explicit op** — which works fine: `["src/index.css", "src/styles/global.css"]`
-  moves the file and rewrites the `import "./index.css"` reference too.
-  The tool doesn't try to guess from the import graph which assets should
-  travel along.
+✓ 129 op(s) validated
+✓ pre-typecheck clean
+✓ plan: 5 phase(s)
+✓ applied 62/129 op(s) in-memory
+✓ imports rewritten in 68 file(s)
+✓ prettier 3.8.3 (122 file(s) formatted)
+· dry-run — not writing to disk
+✓ post-typecheck clean (in-memory overlay)
 
-## Monorepos
+=== summary ===
+phases:           5
+ops total:        129
+  ✓ applied:      62  (moves: 0, moves+rename: 0, extracts: 62)
+  ✗ failed:       67
+files with edits: 122
+diff:             /tmp/front-renamer-2026-05-29T13-38-37Z.patch
 
-front-renamer is built around a single TypeScript project: one `tsconfig`, one
-source directory, one alias scope. That covers **per-package refactors** in
-any monorepo flavor (pnpm / npm / yarn workspaces, Nx, Turborepo, Lerna) —
-just point `--cwd` at the package you're restructuring:
+=== ✓ applied ops (62) ===
+  extracts (62):
+    op#3   toTitleCase       components/.../AutoStatusPill.tsx → helpers.ts
+    op#5   FormBody          components/.../FormLayout.tsx     → FormBody.tsx
+    ...
+
+=== ✗ failed ops (67, 1 cause) ===
+  TS LS internal assertion ("Expected symbol to be a module") — extract these manually — 67 op(s):
+    op#0   IconDropdown      components/.../AppearancePicker.tsx → IconDropdown.tsx
+    ...
+```
+
+Diff is written to one temp file in unified format (`git diff`-style
+sections per file). The console shows the path, not the content.
+
+## Machine-readable report
+
+`--report-json <path>` writes a stable JSON shape next to the run.
+Useful for CI gates and for generating a follow-up ops.json from only
+the failed entries.
 
 ```bash
-cd packages/web
-npx front-renamer ops.json --cwd . --tsconfig tsconfig.json --src src --apply
+front-renamer ops.json --report-json run.json
 ```
 
-`git mv` still works for files anywhere in the repo, so history stays intact
-across the whole monorepo.
+Then in CI:
 
-**What's not supported yet**: cross-package moves (sliding a file from
-`packages/a` into `packages/b` while also rewriting `@org/b`-style workspace
-imports), simultaneous multi-package refactors, and renaming a workspace
-package itself (the `name` in its `package.json` plus every `dependencies`
-reference). These need a bigger workspace-aware mode — coming when there's
-real demand.
+```bash
+# fail the build if anything didn't apply
+[ "$(jq '.ops.failed' run.json)" = "0" ] || exit 1
 
-## Safety
+# regenerate ops.json containing only the failed extracts
+jq '[.failed[] | select(.kind == "extract")
+                 | {extract: .symbol, from, to}]' run.json > retry.json
+```
 
-- **Run from a clean git working tree.** Two reasons:
-  1. **Auto-rollback** snapshots `HEAD` before applying and restores on
-     post-typecheck failure (`git reset --hard <sha> && git clean -fd`).
-     This is the safety net. It only engages when the tree was clean at
-     start — otherwise the rollback would also wipe your unrelated edits.
-     Disable with `--no-rollback`.
-  2. **Manual rollback**. If you somehow disabled auto-rollback or didn't
-     trust it, `git restore . && git clean -fd` still works the same way.
-- **Pre-typecheck**: refuses to run if your project already has TS errors
-  (so post-typecheck failures are clearly attributable to the refactor).
-- **Dry-run by default**: nothing touches disk until you pass `--apply`.
-- **Post-typecheck**: full TS pass after commit. On failure, auto-rollback
-  if armed; otherwise non-zero exit with changes preserved for inspection.
-- **`git mv`**: real moves, not delete+add. `git log --follow` survives.
-- **Empty dirs cleaned up** after moves (deep recursive, with `--no-prune`
-  to disable).
+Top-level keys: `version`, `mode`, `startedAt`, `elapsedMs`, `exitCode`,
+`project` (root / tsconfig / ts / prettier metadata), `ops` (counts +
+breakdown by kind), `applied[]`, `failed[]` (with `category`, `error`,
+`context`, `docs`), `warnings[]`, `imports`, `prettier`, `cssReports[]`,
+`diff`, `rollback`.
 
-> **Run Prettier / ESLint after `--apply`.** The tool emits import specifiers
-> with double quotes (`"./x"`) regardless of your project's style. It also
-> doesn't reformat the surrounding code after rewrites. A single `prettier
-> --write` (or your usual `pnpm run format`) puts everything back in shape.
+## What's resolved from the project
+
+`typescript`, `prettier`, and the entire `tsconfig` (incl. `paths` /
+`baseUrl`) are read from the project itself — version, config, lib.d.ts,
+formatter style. The bundled `typescript` is only a fallback when the
+project has none installed. Header line `ts  X.Y.Z (project|bundled)`
+tells you which one is active.
+
+## What it deliberately doesn't do
+
+- **No code transforms.** Not a codemod. Use jscodeshift / ts-morph for
+  that.
+- **No file splits or merges** beyond `extract`. Moves are unit moves.
+- **No string/comment/JSX-text rewrites.** `"OldName"` in a string stays.
+- **No dynamic-import resolution.** Only string-literal specifiers.
+- **No JS-only repos.** A tsconfig is required.
+- **No external config updates.** `knip.json`, ESLint, Vite aliases,
+  package.json scripts hardcoding paths — yours to update.
+- **No git commit.** Uses `git mv` so history survives, but the commit
+  message is your call.
+- **No cross-package moves in monorepos** (yet). Per-package refactors
+  work — point `--cwd` at the package.
 
 ## Programmatic use
 
@@ -344,12 +261,7 @@ real demand.
 import {loadProject, normalizeOps, buildPlan, Engine} from 'front-renamer';
 
 const project = loadProject(process.cwd());
-const ops = normalizeOps(
-    [
-        ['src/components/Foo', 'src/features/foo/Foo'],
-    ],
-    project.root,
-);
+const ops = normalizeOps([['src/Foo', 'src/features/foo/Foo']], project.root);
 const plan = buildPlan(ops);
 const engine = new Engine(project);
 engine.applyToVFS(plan.levels);

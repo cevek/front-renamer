@@ -1,11 +1,18 @@
 /**
  * Minimal template engine for op destinations.
  *
- * Syntax: `{var|filter|filter:arg|...}` inside a path string. Variables:
- *   - `name`  — full filename (basename), e.g. `MessagesSection.tsx`
- *   - `stem`  — filename without extension, e.g. `MessagesSection`
- *   - `ext`   — extension including dot, e.g. `.tsx` (or empty for folders)
+ * Syntax: `{var|filter|filter:arg|...}` inside a path string.
+ *
+ * Variables (always available):
+ *   - `name`   — full filename (basename), e.g. `MessagesSection.tsx`
+ *   - `stem`   — filename without extension, e.g. `MessagesSection`
+ *   - `ext`    — extension including dot, e.g. `.tsx` (or empty for folders)
  *   - `parent` — name of the directory the entry sits in
+ *
+ * Variables (extract-op context only):
+ *   - `symbol` — the symbol being extracted (e.g. `Header`)
+ *   - `dir`    — project-relative directory of `from`
+ *                (e.g. `src/features/sales`)
  *
  * Filters (left-to-right):
  *   - `lc`             — lowercase
@@ -14,10 +21,16 @@
  *   - `strip:Suffix`   — remove trailing `Suffix` if present
  *   - `stripPrefix:X`  — remove leading `X` if present
  *
- * Example:
- *   pattern: "src/features/{stem|strip:Section|kebab}/{stem|strip:Section}View.tsx"
- *   input:   "src/pages/MessagesSection.tsx"
- *   result:  "src/features/messages/MessagesView.tsx"
+ * Examples:
+ *   glob move:
+ *     pattern: "src/features/{stem|strip:Section|kebab}/{stem|strip:Section}View.tsx"
+ *     input:   "src/pages/MessagesSection.tsx"
+ *     result:  "src/features/messages/MessagesView.tsx"
+ *
+ *   --extract-to (folder-per-component layout):
+ *     pattern: "{dir}/{symbol}/{symbol}.tsx"
+ *     extract: "Header", from: "src/Sales/Sales.tsx"
+ *     result:  "src/Sales/Header/Header.tsx"
  */
 import * as path from 'node:path';
 
@@ -26,6 +39,10 @@ export interface TemplateVars {
     stem: string;
     ext: string;
     parent: string;
+    /** Extract context: the symbol being lifted. */
+    symbol?: string;
+    /** Extract context: project-relative directory of `from`. */
+    dir?: string;
 }
 
 export function deriveVars(fullEntryPath: string): TemplateVars {
@@ -34,6 +51,16 @@ export function deriveVars(fullEntryPath: string): TemplateVars {
     const stem = ext ? name.slice(0, -ext.length) : name;
     const parent = path.basename(path.dirname(fullEntryPath));
     return {name, stem, ext, parent};
+}
+
+/**
+ * Build template vars for an `extract` op — keeps the base set (`name`/`stem`
+ * /`ext`/`parent`) and adds `symbol` + `dir`. `fromRel` is project-relative.
+ */
+export function deriveExtractVars(fromRel: string, symbol: string): TemplateVars {
+    const base = deriveVars(fromRel);
+    const dir = path.dirname(fromRel);
+    return {...base, symbol, dir: dir === '.' ? '' : dir};
 }
 
 export function isTemplate(s: string): boolean {
@@ -54,11 +81,17 @@ export function renderTemplate(template: string, vars: TemplateVars): string {
 
 function readVar(name: string, vars: TemplateVars): string {
     // `in` traverses the prototype chain — would let `{constructor}` etc. coerce
-    // into garbage. Use Object.hasOwn so only the four documented vars are valid.
-    if (Object.prototype.hasOwnProperty.call(vars, name)) {
-        return (vars as unknown as Record<string, string>)[name];
+    // into garbage. Use Object.hasOwn so only documented vars are valid. Also
+    // reject vars that ARE on the type but were not provided for this op
+    // (e.g. `{symbol}` in a move-op context).
+    if (!Object.prototype.hasOwnProperty.call(vars, name)) {
+        throw new Error(`unknown template variable: {${name}}`);
     }
-    throw new Error(`unknown template variable: ${name}`);
+    const raw = (vars as unknown as Record<string, string | undefined>)[name];
+    if (typeof raw !== 'string') {
+        throw new Error(`template variable {${name}} is not available in this context`);
+    }
+    return raw;
 }
 
 function applyFilter(filter: string, value: string): string {
